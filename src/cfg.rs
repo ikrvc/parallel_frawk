@@ -3,17 +3,21 @@ use crate::ast::{self, Expr, Stmt, Unop};
 use crate::builtins::{self, IsSprintf};
 use crate::common::{Either, FileSpec, Graph, NodeIx, NumTy, Result, Stage};
 use crate::dom;
+use crate::parallelization::find_global;
 
 use hashbrown::{HashMap, HashSet};
 use petgraph::Direction;
 use smallvec::smallvec; // macro
 
-use std::collections::VecDeque;
+use std::collections::{VecDeque};
 use std::convert::TryFrom;
+use std::env::vars;
 use std::fmt;
 use std::hash::Hash;
 use std::io;
 use std::mem;
+use crate::parallelization::ast_check_parallelization::{check_parallelizability, ParallelOp};
+use crate::parallelization::find_global::GlobalVar;
 
 pub(crate) type SmallVec<T> = smallvec::SmallVec<[T; 4]>;
 
@@ -276,7 +280,7 @@ fn valid_lhs<I>(e: &ast::Expr<I>) -> bool {
 
 #[derive(Debug)]
 pub(crate) struct ProgramContext<'a, I> {
-    shared: GlobalContext<I>,
+    pub shared: GlobalContext<I>,
     // Functions "know" which Option<Ident> maps to which offset in this
     // table at construction time (in the func_table passed to View).
     pub funcs: Vec<Function<'a, I>>,
@@ -288,6 +292,7 @@ pub(crate) struct ProgramContext<'a, I> {
     pub fold_regex_constants: bool,
     // Thread through information regarding header columns used.
     pub parse_header: bool,
+    pub can_parallelize: bool,
 }
 
 impl<'a, I> ProgramContext<'a, I> {
@@ -489,6 +494,29 @@ where
             f.ret = ret;
             funcs.push(f);
         }
+        for dec in &p.decs {
+            println!("{:#?}", dec);
+        }
+
+        // Print begin statements
+        for stmt in &p.begin {
+            println!("{:#?}", stmt);
+        }
+
+        // Print pats
+        for (pat, maybe_stmt) in &p.pats {
+            println!("pat = {:#?}, stmt = {:?}", pat, maybe_stmt);
+        }
+        let mut vars_with_assign = find_global::find_global(&p);
+        println!("Variables changed in the main loop: {:#?}", vars_with_assign);
+        let parallelization;
+        if !vars_with_assign.0 {
+            parallelization = (false, std::collections::HashMap::<GlobalVar<I>, ParallelOp>::new());
+        } else {
+            parallelization = check_parallelizability(&p, &vars_with_assign.1);
+        }
+        println!("Parallelization check results: {:#?}", parallelization);
+
         // Now that we have all the functions in place, it's time to fill them up and convert them
         // to SSA.
         macro_rules! fill {
@@ -524,9 +552,11 @@ where
             }
             .fill(fundec.body)?;
         }
-
+        // eprintln!("AST before parallel_check: {:?}", p);
         // Bind the main function
-        let main_offset = match p.desugar_stage(arena) {
+        let desugared = p.desugar_stage(arena);
+        // eprintln!("{:?}", desugared);
+        let main_offset = match desugared {
             Stage::Main(main_stmt) => {
                 Stage::Main(fill!(Some(main_stmt), FunctionName::MainLoop).unwrap())
             }
@@ -554,15 +584,21 @@ where
                 }
             }
         };
-
-        Ok(ProgramContext {
+        // eprintln!("{:#?}", shared);
+        let context = ProgramContext {
             shared,
             funcs,
             main_offset,
             allow_arbitrary_commands: false,
             fold_regex_constants: false,
             parse_header: p.parse_header,
-        })
+            can_parallelize: parallelization.0,
+        };
+        // let (parallelizable_dependencies, vars_dependent_on_global) = check_global_variable_dependency(&vars_with_assingm, &context);
+        // if !parallelizable_dependencies {context.can_parallelize = false;}
+        // let res = check_parallelization(&vars_with_assingm, &vars_dependent_on_global, &context);
+        // eprintln!("Is parallelizable: {:?}", res);
+        Ok(context)
     }
 }
 
@@ -574,9 +610,9 @@ struct View<'a, 'b, I> {
 }
 
 #[derive(Debug)]
-struct GlobalContext<I> {
+pub struct GlobalContext<I> {
     // Map the identifiers from the AST to this IR's Idents.
-    hm: HashMap<I, Ident>,
+    pub hm: HashMap<I, Ident>,
     // Global identifiers to rewrite global => local. We only store the `low` field of the
     // identifier.
     local_globals: HashSet<NumTy>,

@@ -31,6 +31,7 @@ mod string_constants;
 #[cfg(test)]
 mod test_string_constants;
 pub mod types;
+mod parallelization;
 
 use clap::{Arg, Command};
 
@@ -397,7 +398,11 @@ fn main() {
              .short('j')
              .requires("parallel-strategy")
              .takes_value(true)
-             .help("Number or worker threads to launch when executing in parallel, requires '-p' flag to be set. When using record-level parallelism, this value is an upper bound on the number of worker threads that will be spawned; the number of active worker threads is chosen dynamically"));
+             .help("Number or worker threads to launch when executing in parallel, requires '-p' flag to be set. When using record-level parallelism, this value is an upper bound on the number of worker threads that will be spawned; the number of active worker threads is chosen dynamically"))
+        .arg(Arg::new("check-parallel")
+             .long("check-parallel")
+             .takes_value(false)
+             .help("Check if the program is parallelizable"));
     cfg_if::cfg_if! {
         if #[cfg(feature = "llvm_backend")] {
             app = app.arg(Arg::new("dump-llvm")
@@ -693,6 +698,10 @@ fn main() {
 
     let a = Arena::default();
     let ctx = get_context(program_string.as_str(), &a, get_prelude(&a, &raw));
+    let opt_check_parallel = matches.is_present("check-parallel");
+    if opt_check_parallel {
+        println!("Parallelizable: {}", ctx.can_parallelize);
+    }
     let analysis_result = ctx.analyze_sep_assignments();
     let out_file = matches.value_of("out-file");
     macro_rules! with_io {

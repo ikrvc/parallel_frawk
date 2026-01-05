@@ -118,7 +118,7 @@ impl<T> Stage<T> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Either<L, R> {
     Left(L),
     Right(R),
