@@ -4,9 +4,7 @@ use crate::cfg::{self, is_unused, Function, Ident, PrimExpr, PrimStmt, PrimVal, 
 use crate::codegen;
 #[cfg(feature = "llvm_backend")]
 use crate::codegen::llvm;
-use crate::common::{
-    CancelSignal, CompileError, Either, Graph, NodeIx, NumTy, Result, Stage, WorkList,
-};
+use crate::common::{CancelSignal, CompileError, Either, ExecutionStrategy, Graph, NodeIx, NumTy, Result, Stage, WorkList};
 use crate::cross_stage;
 use crate::input_taint::TaintedStringAnalysis;
 use crate::pushdown::{FieldSet, UsedFieldAnalysis};
@@ -21,6 +19,10 @@ use smallvec::smallvec;
 use std::collections::VecDeque;
 use std::mem;
 use std::sync::Arc;
+use crate::common::Either::{Left, Right};
+use crate::parallelization::ast_check_parallelization::ParallelOp;
+use crate::parallelization::ast_check_parallelization::ParallelOp::LastAssigned;
+use crate::parallelization::find_global::{GlobalVar, IndexVal};
 
 pub(crate) const UNUSED: u32 = u32::max_value();
 pub(crate) const NULL_REG: u32 = UNUSED - 1;
@@ -219,6 +221,8 @@ pub(crate) fn run_llvm<'a>(
             named_cols,
             cfg.num_workers,
             cancel_signal,
+            ExecutionStrategy::Serial,
+            None
         )
     }
 }
@@ -229,6 +233,7 @@ pub(crate) fn run_cranelift<'a>(
     ff: impl runtime::writers::FileFactory,
     cfg: codegen::Config,
     cancel_signal: CancelSignal,
+    execution_strategy: ExecutionStrategy,
 ) -> Result<()> {
     use codegen::clif::Generator;
     let mut typer = Typer::init_from_ctx(ctx)?;
@@ -244,6 +249,8 @@ pub(crate) fn run_cranelift<'a>(
             named_cols,
             cfg.num_workers,
             cancel_signal,
+            execution_strategy,
+            typer.parallelization_slots.clone()
         )
     }
 }
@@ -265,7 +272,7 @@ pub(crate) enum HighLevel {
     DropIter(NumTy, Ty),
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Registers {
     stats: RegStatuses,
     globals: HashMap<Ident, (u32, Ty)>,
@@ -364,9 +371,12 @@ pub(crate) struct Typer<'a> {
     // variables in the LLVM backend. It is computed lazily because these are not needed for
     // serial, bytecode-only scripts.
     global_refs: Option<Vec<HashSet<(NumTy, Ty)>>>,
+
+    // parallelization_slots: Option<SlotCounter>,
+    parallelization_slots: Option<HashMap<(Ty, usize), Either<HashSet<(IndexVal<'a>, ParallelOp)>, ParallelOp>>>
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct SlotCounter {
     slots: HashMap<(NumTy, Ty), usize>,
     counter: HashMap<Ty, usize>,
@@ -539,6 +549,7 @@ impl<'a> Typer<'a> {
             ff,
             &self.used_fields,
             cols,
+            self.parallelization_slots.clone()
         ))
     }
 
@@ -804,7 +815,59 @@ impl<'a> Typer<'a> {
         // TODO: mark used frames first and then exclude them from the analyses?
         gen.run_analyses()?;
         gen.mark_used_frames();
-        gen.add_slots()?;
+
+        let mut assignedSlots = None;
+        if let Some(par_map) = &pc.parallelization_variables {
+            let mut slotSet = HashSet::new();
+            for (id, op_set) in par_map {
+                if gen.regs.globals.contains_key(id) {
+                    let reg = gen.regs.globals.get(id).unwrap();
+                    match reg.1 {
+                        Ty::Int | Ty::Float | Ty::Str => {
+                            for (var, op) in op_set.iter() {
+                                if *op == LastAssigned {
+                                    slotSet.insert(reg.clone());
+                                }
+                                else {continue}
+                            }
+                        }
+                        _ => continue
+                    }
+                }
+            }
+            assignedSlots = Some(slotSet);
+        }
+
+        let counter = gen.add_slots(assignedSlots)?;
+
+
+        // Option<HashMap<(NumTy, Ty), (usize, Either<HashSet<(IndexVal<'a>, ParallelOp)>, ParallelOp>)>>
+        if let Some(par_map) = &pc.parallelization_variables {
+            let mut slotMap = HashMap::new();
+            for (id, op_set) in par_map {
+                if gen.regs.globals.contains_key(id){
+                    let reg = gen.regs.globals.get(id).unwrap();
+                    if let Some(c) = counter.slots.get(reg) {
+                        let mut res = HashSet::new();
+                        for (var, op) in op_set.iter() {
+                            if let GlobalVar::ArrayExact(_, val) = var {
+                                res.insert((val.clone(), *op));
+                            } else {
+                                slotMap.insert((reg.1, c.clone()), Right(*op));
+                            }
+                        }
+                        if !res.is_empty() {
+                            slotMap.insert((reg.1, c.clone()), Left(res));
+                        }
+                    }
+                }
+            }
+            gen.parallelization_slots = Some(slotMap);
+        } else {
+            gen.parallelization_slots = None;
+        }
+
+        // eprintln!("Parallelization slots: {:?}", gen.parallelization_slots);
         Ok(gen)
     }
 
@@ -908,10 +971,10 @@ impl<'a> Typer<'a> {
         }
     }
 
-    fn add_slots(&mut self) -> Result<()> {
+    fn add_slots(&mut self, assignedSlots: Option<HashSet<(NumTy, Ty)>>) -> Result<SlotCounter> {
         use cross_stage::compute_slots;
         let (begin, main_loop, end) = match self.main_offset {
-            Stage::Main(_) => return Ok(()),
+            Stage::Main(_) => return Ok(SlotCounter::default()),
             Stage::Par {
                 begin,
                 main_loop,
@@ -919,7 +982,8 @@ impl<'a> Typer<'a> {
             } => (begin, main_loop, end),
         };
         let global_refs = self.get_global_refs();
-        let slots = compute_slots(&begin, &main_loop, &end, global_refs);
+        let slots = compute_slots(&begin, &main_loop, &end, global_refs, assignedSlots);
+        // eprintln!("Stored begin slots: {:?}", slots.begin_stores);
         let mut ctr = SlotCounter::default();
 
         // Begin stores the context of begin_stores
@@ -933,8 +997,7 @@ impl<'a> Typer<'a> {
         if let Some(off) = end {
             self.frames[off].load_slots(slots.loop_stores.iter().cloned(), &mut ctr)?;
         }
-
-        Ok(())
+        Ok(ctr)
     }
 
     pub(crate) fn get_global_refs(&mut self) -> Vec<HashSet<(NumTy, Ty)>> {

@@ -1,10 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::hash::Hash;
 use builtins::Variable;
 use crate::{ast, builtins};
 use crate::ast::{Expr, Pattern, Stmt};
+use crate::builtins::Function;
+use crate::common::Either;
+use crate::parallelization::ast_check_parallelization::define_builtin;
 
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub enum GlobalVar<'a, I: Clone + Hash + Eq + Debug> {
@@ -31,11 +34,13 @@ enum ArrType {
 /// Returns the global variables (the ones that have at least one assignment in the main loop).
 pub fn find_global<'a, I: Clone + Hash + Eq + Debug>(program: &ast::Prog<'_, 'a, I>) -> (bool, HashSet<GlobalVar<'a, I>>)
 where
-    Variable: TryFrom<I>
+    Variable: TryFrom<I>, Function: TryFrom<I>
 {
     let mut res = HashSet::new();
     let mut array_type: HashMap<I, ArrType> = HashMap::new();
+    let mut amount = 0;
     for (pattern, maybe_stmt) in &program.pats {
+        amount+=1;
         let val = has_assigns_in_pattern(pattern, &mut array_type);
         if !val.0 {return (false, HashSet::new())}
         res.extend(val.1);
@@ -47,6 +52,9 @@ where
             },
             None => continue,
         }
+    }
+    if amount == 0 {
+        println!("No main statements")
     }
     let mut no_builtin_change = true;
     let res = res.into_iter().map(|x| {
@@ -76,7 +84,8 @@ fn arr_type_sim(i: &IndexVal, val: &ArrType) -> bool {
     }
 }
 
-fn has_assigns_in_pattern<'a, I: Clone + Hash + Eq+Debug>(pattern: &Pattern<'_, 'a, I>, array_type: &mut HashMap<I, ArrType>) -> (bool, HashSet<GlobalVar<'a, I>>) where builtins::Variable: TryFrom<I> {
+fn has_assigns_in_pattern<'a, I: Clone + Hash + Eq+Debug>(pattern: &Pattern<'_, 'a, I>, array_type: &mut HashMap<I, ArrType>) -> (bool, HashSet<GlobalVar<'a, I>>) where
+    Variable: TryFrom<I>, Function: TryFrom<I> {
     match pattern {
         Pattern::Null => (true, HashSet::new()),
         Pattern::Comma(e1, e2) => (false, HashSet::new()),
@@ -85,7 +94,8 @@ fn has_assigns_in_pattern<'a, I: Clone + Hash + Eq+Debug>(pattern: &Pattern<'_, 
 }
 
 /// Returns any variable assignments in the main loop
-fn has_assigns_in_stmt<'a, I: Clone + Hash + Eq + Debug>(stmt: &Stmt<'_, 'a, I>, array_type: &mut HashMap<I, ArrType>) -> (bool, HashSet<GlobalVar<'a, I>>) where builtins::Variable: TryFrom<I> {
+fn has_assigns_in_stmt<'a, I: Clone + Hash + Eq + Debug>(stmt: &Stmt<'_, 'a, I>, array_type: &mut HashMap<I, ArrType>) -> (bool, HashSet<GlobalVar<'a, I>>)
+where Variable: TryFrom<I>, Function: TryFrom<I> {
     match stmt {
         Stmt::Break | Stmt::Continue | Stmt::Next | Stmt::NextFile => (true, HashSet::new()),
         Stmt::StartCond(..) | Stmt::EndCond(..) | Stmt::LastCond(..) => (true, HashSet::new()),
@@ -151,11 +161,30 @@ fn has_assigns_in_stmt<'a, I: Clone + Hash + Eq + Debug>(stmt: &Stmt<'_, 'a, I>,
             res
         }
 
-        _ => panic!("Not implemented exception in find global statement: {:?}", stmt),
+        Stmt::Printf(exp, vec, optexpr) => {
+            let mut res = has_assigns_in_expr(exp, array_type);
+            for val in vec.iter() {
+                connect_two_hashsets(&mut res, has_assigns_in_expr(val, array_type));
+            }
+            if let Some((expr, _)) = optexpr {
+                connect_two_hashsets(&mut res, has_assigns_in_expr(expr, array_type));
+            }
+            res
+        }
+
+        Stmt::Return(val) => {
+            if let Some(expr) = val {
+                has_assigns_in_expr(expr, array_type)
+            } else {
+                (true, HashSet::new())
+            }
+        }
     }
 }
 
-fn has_assigns_in_expr<'a, I: Clone + Hash + Eq + Debug>(expr: &Expr<'_, 'a, I>, array_type: &mut HashMap<I, ArrType>) -> (bool, HashSet<GlobalVar<'a, I>>) where  Variable: TryFrom<I> {
+fn has_assigns_in_expr<'a, I: Clone + Hash + Eq + Debug>(expr: &Expr<'_, 'a, I>, array_type: &mut HashMap<I, ArrType>) -> (bool, HashSet<GlobalVar<'a, I>>) where
+    Variable: TryFrom<I> , Function: TryFrom<I>
+{
     match expr {
         Expr::ILit(..) | Expr::FLit(..) | Expr::PatLit(..) | Expr::StrLit(..) |
         Expr::ReadStdin | Expr::Cond(..) => (true, HashSet::new()),
@@ -241,7 +270,43 @@ fn has_assigns_in_expr<'a, I: Clone + Hash + Eq + Debug>(expr: &Expr<'_, 'a, I>,
             }
             res
         }
-        _ => panic!("Not implemented exception in find global expression: {:?}", expr),
+        Expr::Call(func, args) => {
+            let mut res = (true, HashSet::new());
+            let func = define_builtin(func);
+            match func {
+                Either::Left(_) => {}
+                Either::Right(expr) => {
+                    match expr {
+                        Function::Split => {
+                            extract_split_args(&mut res, args);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for val in args.iter() {
+                connect_two_hashsets(&mut res, has_assigns_in_expr(val, array_type));
+            }
+            res
+        }
+        Expr::Getline {..} => (true, HashSet::new()),
+        // _ => panic!("Not implemented exception in find global expression: {:?}", expr),
+    }
+}
+
+fn extract_split_args<'a, I: Clone + Hash + Eq + Debug>(res: &mut (bool, HashSet<GlobalVar<'a, I>>), args: &[&Expr<I>]) {
+    if res.0 == false {return}
+
+    match args.get(1).unwrap_or_else(|| panic!("Split is used with less than one argument")) {
+        Expr::Var(i) => {res.1.insert(GlobalVar::ArrayUnknown(i.clone()));}
+        _ => panic!("Split is used with incorrect argument type")
+    }
+
+    if let Some(val) = args.get(3) {
+        match val {
+            Expr::Var(i) => { res.1.insert(GlobalVar::ArrayUnknown(i.clone())); }
+            _ => panic!("Split is used with incorrect argument type")
+        }
     }
 }
 

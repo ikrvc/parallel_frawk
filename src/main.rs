@@ -47,7 +47,8 @@ use runtime::{
     ChainedReader, LineReader, CHUNK_SIZE,
 };
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
+use std::io::{Seek, SeekFrom};
 use std::iter::once;
 use std::mem;
 
@@ -89,34 +90,152 @@ struct Prelude<'a> {
     scalars: PreludeScalars,
 }
 
-// TODO: make file reading lazy
-fn open_file_read(f: &str) -> impl io::BufRead {
-    enum LazyReader<F, R> {
-        Uninit(F),
-        Init(R),
-    }
+enum LazyReader<F, R> {
+    Uninit(F),
+    Init(R),
+}
 
-    impl<R, F: FnMut() -> io::Result<R>> LazyReader<F, R> {
-        fn delegate<T>(&mut self, next: impl FnOnce(&mut R) -> io::Result<T>) -> io::Result<T> {
-            match self {
-                LazyReader::Uninit(f) => {
-                    *self = LazyReader::Init(f()?);
-                    self.delegate(next)
-                }
-                LazyReader::Init(r) => next(r),
+impl<R, F: FnMut() -> io::Result<R>> LazyReader<F, R> {
+    fn delegate<T>(&mut self, next: impl FnOnce(&mut R) -> io::Result<T>) -> io::Result<T> {
+        match self {
+            LazyReader::Uninit(f) => {
+                *self = LazyReader::Init(f()?);
+                self.delegate(next)
             }
+            LazyReader::Init(r) => next(r),
         }
     }
+}
 
-    // TODO: delegate other methods on read.
-    impl<R: io::Read, F: FnMut() -> io::Result<R>> io::Read for LazyReader<F, R> {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.delegate(|r| r.read(buf))
-        }
+// TODO: delegate other methods on read.
+impl<R: io::Read, F: FnMut() -> io::Result<R>> io::Read for LazyReader<F, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.delegate(|r| r.read(buf))
     }
+}
 
+impl<R: io::Seek, F: FnMut() -> io::Result<R>> io::Seek for LazyReader<F, R> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.delegate(|r| r.seek(pos))
+    }
+}
+
+// TODO: make file reading lazy
+fn open_file_read(f: &str) -> BufReader<LazyReader<impl FnMut() -> io::Result<File>, File>> {
     let filename = String::from(f);
     BufReader::new(LazyReader::Uninit(move || File::open(filename.as_str())))
+}
+
+pub struct SlicedReader<R> {
+    inner: R,
+    start: u64,
+    end: u64,
+    pos: u64,
+    initial_seek_done: bool,
+}
+
+impl<R: io::Read + Seek> SlicedReader<R> {
+    pub fn new(inner: R, start: u64, end: u64) -> io::Result<Self> {
+        Ok(Self {
+            inner,
+            start,
+            end,
+            pos: start,
+            initial_seek_done: false,
+        })
+    }
+
+    fn ensure_initial_seek(&mut self) -> io::Result<()> {
+        if !self.initial_seek_done {
+            self.inner.seek(SeekFrom::Start(self.start))?;
+            self.initial_seek_done = true;
+        }
+        Ok(())
+    }
+}
+
+impl<R: io::Read + Seek> io::Read for SlicedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.ensure_initial_seek()?;
+
+        if self.pos >= self.end {
+            return Ok(0); // EOF for slice
+        }
+
+        // Limit read to slice boundary
+        let max = (self.end - self.pos) as usize;
+        let to_read = buf.len().min(max);
+
+        let n = self.inner.read(&mut buf[..to_read])?;
+        self.pos += n as u64;
+
+        Ok(n)
+    }
+}
+
+fn open_sliced_file_read(
+    f: &str,
+    start: u64,
+    end: u64,
+) -> BufReader<LazyReader<impl FnMut() -> io::Result<SlicedReader<File>>, SlicedReader<File>>>
+{
+    let filename = String::from(f);
+
+    BufReader::new(LazyReader::Uninit(move || {
+        let file = File::open(&filename)?;
+        SlicedReader::new(file, start, end)
+    }))
+}
+
+/// Align position forward to next newline.
+/// If `pos` is already on a newline, returns the next byte.
+fn align_start_to_newline(file: &File, pos: u64) -> std::io::Result<u64> {
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(pos))?;
+
+    let mut buffer = [0u8; 8192]; // read 8KB at a time
+    let mut cur_pos = pos;
+
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            // EOF
+            return Ok(file.metadata()?.len());
+        }
+        if let Some(idx) = buffer[..n].iter().position(|&b| b == b'\n') {
+            return Ok(cur_pos + idx as u64 + 1); // position after newline
+        }
+        cur_pos += n as u64;
+    }
+}
+
+/// Split file into N newline-aligned byte ranges.
+pub fn compute_splits(path: &str, n: usize) -> std::io::Result<Vec<(u64, u64)>> {
+    let file = File::open(path)?;
+    let size = file.metadata()?.len();
+
+    let approx = size / n as u64;
+    let mut starts = Vec::with_capacity(n + 1);
+
+    // initial approximate starts
+    for i in 0..n {
+        starts.push(i as u64 * approx);
+    }
+    starts.push(size); // sentinel
+
+    // adjust starts to next newline (except chunk 0 which must stay at 0)
+    for i in 1..n {
+        let aligned = align_start_to_newline(&file, starts[i])?;
+        starts[i] = aligned;
+    }
+
+    // form (start, end) pairs
+    let mut result = Vec::with_capacity(n);
+    for i in 0..n {
+        result.push((starts[i], starts[i + 1]));
+    }
+    // eprintln!("File size: {:?}, Splits: {:?}", size, result);
+    Ok(result)
 }
 
 fn chained<LR: LineReader>(lr: LR) -> ChainedReader<LR> {
@@ -236,8 +355,9 @@ fn run_cranelift_with_context<'a>(
     ff: impl runtime::writers::FileFactory,
     cfg: codegen::Config,
     signal: CancelSignal,
+    execution_strategy: ExecutionStrategy,
 ) {
-    if let Err(e) = compile::run_cranelift(&mut ctx, stdin, ff, cfg, signal) {
+    if let Err(e) = compile::run_cranelift(&mut ctx, stdin, ff, cfg, signal, execution_strategy) {
         fail!("error compiling cranelift: {}", e)
     }
 }
@@ -384,7 +504,7 @@ fn main() {
         .arg(Arg::new("parallel-strategy")
              .short('p')
              .help("Attempt to execute the script in parallel. Strategy r[ecord] parallelizes within the current input file. Strategy f[ile] parallelizes between input files")
-             .possible_values(["r", "record", "f", "file"]))
+             .possible_values(["r", "record", "f", "file", "a", "auto"]))
         .arg(Arg::new("chunk-size")
              .long("chunk-size")
              .takes_value(true)
@@ -421,6 +541,7 @@ fn main() {
     let exec_strategy = match matches.value_of("parallel-strategy") {
         Some("r") | Some("record") => ExecutionStrategy::ShardPerRecord,
         Some("f") | Some("file") => ExecutionStrategy::ShardPerFile,
+        Some("a") | Some("auto") => ExecutionStrategy::AutomaticParallelization,
         None => ExecutionStrategy::Serial,
         Some(x) => fail!(
             "invalid execution strategy (clap arg parsing should handle this): {}",
@@ -564,6 +685,62 @@ fn main() {
     // types, making functions hard to write. Still, there must be something to be done to clean
     // this up here.
     macro_rules! with_inp {
+        ($analysis:expr,
+         slice = $slice:expr,
+         workers = $workers:expr,
+         $inp:ident,
+         $body:expr) => {{
+            if $slice {
+                match $analysis {
+                    cfg::SepAssign::Potential {
+                        field_sep,
+                        record_sep,
+                    } => {
+                        let field_sep = field_sep.unwrap_or(b" ");
+                        let record_sep = record_sep.unwrap_or(b"\n");
+                        // number of workers = number of slices
+                        let file_handles: Vec<_> = input_files
+                            .iter()
+                            .cloned()
+                            .flat_map(|file| {
+                                let splits = compute_splits(&file, $workers).unwrap();
+                                splits.into_iter().map(move |(s, e)| {
+                                    let fname = file.clone();
+                                    (open_sliced_file_read(&fname, s, e), fname)
+                                })
+                            })
+                            .collect();
+
+                        if field_sep == b" " && record_sep == b"\n" {
+                            let $inp = ByteReader::new_whitespace(
+                                file_handles.into_iter(),
+                                chunk_size,
+                                check_utf8,
+                                exec_strategy,
+                                signal.clone(),
+                            );
+                            $body
+                        } else {
+                            let $inp = ByteReader::new(
+                                file_handles.into_iter(),
+                                field_sep[0],
+                                record_sep[0],
+                                chunk_size,
+                                check_utf8,
+                                exec_strategy,
+                                signal.clone(),
+                            );
+                            $body
+                        }
+                    }
+                    _ => { with_inp!($analysis, $inp, $body) }
+                }
+            } else {
+                // fallback to your original macro body
+                with_inp!($analysis, $inp, $body)
+            }
+        }};
+
         ($analysis:expr, $inp:ident, $body:expr) => {{
             if input_files.len() == 0 {
                 let _reader: Box<dyn io::Read + Send> = Box::new(io::stdin());
@@ -698,13 +875,35 @@ fn main() {
 
     let a = Arena::default();
     let ctx = get_context(program_string.as_str(), &a, get_prelude(&a, &raw));
+
     let opt_check_parallel = matches.is_present("check-parallel");
     if opt_check_parallel {
         println!("Parallelizable: {}", ctx.can_parallelize);
+        return
     }
+
     let analysis_result = ctx.analyze_sep_assignments();
     let out_file = matches.value_of("out-file");
     macro_rules! with_io {
+        (
+        slice = $slice:expr,
+        workers = $workers:expr,
+        |$inp:ident, $out:ident| $body:expr
+        ) => {{
+            match out_file {
+                Some(oup) => {
+                    let $out = runtime::writers::factory_from_file(oup)
+                        .unwrap_or_else(|e| fail!("failed to open {}: {}", oup, e));
+
+                    with_inp!(analysis_result, slice = $slice, workers = $workers, $inp, $body);
+                }
+                None => {
+                    let $out = runtime::writers::default_factory();
+
+                    with_inp!(analysis_result, slice = $slice, workers = $workers, $inp, $body);
+                }
+            }
+        }};
         (|$inp:ident, $out:ident| $body:expr) => {
             match out_file {
                 Some(oup) => {
@@ -742,7 +941,8 @@ fn main() {
             with_io!(|inp, oup| run_interp_with_context(ctx, inp, oup, num_workers))
         }
         None | Some("cranelift") => {
-            with_io!(|inp, oup| run_cranelift_with_context(
+            if ctx.can_parallelize && matches!(exec_strategy, ExecutionStrategy::AutomaticParallelization) {
+                with_io!(slice = true, workers = num_workers, |inp, oup| run_cranelift_with_context(
                 ctx,
                 inp,
                 oup,
@@ -751,7 +951,21 @@ fn main() {
                     num_workers,
                 },
                 signal,
-            ));
+                exec_strategy,
+                ))
+            } else {
+                with_io!(|inp, oup| run_cranelift_with_context(
+                    ctx,
+                    inp,
+                    oup,
+                    codegen::Config {
+                        opt_level: opt_level as usize,
+                        num_workers,
+                    },
+                    signal,
+                    ExecutionStrategy::Serial,
+                ))
+            }
         }
         Some(b) => {
             fail!("invalid backend: {:?}", b);

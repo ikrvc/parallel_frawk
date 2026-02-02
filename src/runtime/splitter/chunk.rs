@@ -1,11 +1,12 @@
 use std::borrow::Borrow;
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::mem;
 use std::sync::Arc;
 
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
-use crate::common::{CancelSignal, Result};
+use crate::common::{CancelSignal, Either, Result};
+use crate::common::Either::Left;
 use crate::runtime::{
     splitter::{
         batch::{
@@ -36,7 +37,7 @@ pub trait ChunkProducer {
     // implementations are not Send, even though the data to initialize a new ChunkProducer reading
     // from the same source is Send. Passing a FnOnce allows us to handle this, which is the case
     // for (e.g.) ShardedChunkProducer.
-    fn try_dyn_resize(&self, _requested_size: usize) -> DynamicProducers<Self::Chunk> {
+    fn try_dyn_resize(&mut self, _requested_size: usize) -> DynamicProducers<Self::Chunk> {
         vec![]
     }
     fn wait(&self) -> bool {
@@ -218,7 +219,7 @@ pub fn new_chained_offset_chunk_producer_ascii_whitespace<
 
 impl<C: Chunk> ChunkProducer for Box<dyn ChunkProducer<Chunk = C>> {
     type Chunk = C;
-    fn try_dyn_resize(&self, requested_size: usize) -> DynamicProducers<C> {
+    fn try_dyn_resize(&mut self, requested_size: usize) -> DynamicProducers<C> {
         (**self).try_dyn_resize(requested_size)
     }
     fn wait(&self) -> bool {
@@ -561,11 +562,13 @@ impl<P: ChunkProducer + 'static> ParallelChunkProducer<P> {
 
 impl<P: ChunkProducer + 'static> ChunkProducer for ParallelChunkProducer<P> {
     type Chunk = P::Chunk;
-    fn try_dyn_resize(&self, requested_size: usize) -> DynamicProducers<P::Chunk> {
+    fn try_dyn_resize(&mut self, requested_size: usize) -> DynamicProducers<P::Chunk> {
         let mut res = Vec::with_capacity(requested_size);
         for _ in 0..requested_size {
             let p = self.clone();
-            res.push(Box::new(move || Box::new(p) as Box<dyn ChunkProducer<Chunk = P::Chunk>>) as _)
+            res.push(Box::new(move || Box::new(
+                p
+            ) as Box<dyn ChunkProducer<Chunk = P::Chunk>>) as _)
         }
         res
     }
@@ -598,6 +601,145 @@ enum ProducerState<T> {
 pub struct ShardedChunkProducer<P> {
     incoming: Receiver<Box<dyn FnOnce() -> P + Send>>,
     state: ProducerState<P>,
+}
+
+// pub struct SlicedChunkProducer<P> {
+//     slices: Box<dyn Iterator<Item =dyn FnOnce() -> P + 'static + Send> + Send>,
+//     counter: usize,
+//     uninit_producer: Box<dyn FnOnce() -> P + 'static + Send>,
+//     current_producer: Option<P>,
+// }
+
+pub struct SlicedChunkProducer<P, F, I>
+where
+    I: Iterator<Item = F>,
+    F: FnOnce() -> P + Send,
+{
+    slices: I,
+    counter: usize,
+    inner: Option<P>,   // becomes Some(P) after first get_chunk
+    factory: Option<F>, // removed after calling it
+}
+
+impl<P, F, I> SlicedChunkProducer<P, F, I>
+where
+    P: ChunkProducer + 'static,
+    F: FnOnce() -> P + Send,
+    I: Iterator<Item = F> + Send,
+{
+    pub fn new(mut ps: I) -> SlicedChunkProducer<P, F, I> {
+        let first = ps.next().expect("SlicedChunkProducer requires at least one slice");
+
+        SlicedChunkProducer {
+            slices: ps,
+            counter: 0,
+            inner:None,
+            factory: Some(first),
+        }
+    }
+
+    fn ensure_init(&mut self) {
+        if self.inner.is_none() {
+            // Take F out, call it, initialize inner P
+            let f = self.factory.take().expect("factory missing");
+            self.inner = Some(f());
+        }
+    }
+}
+
+impl<P, F, I> ChunkProducer for SlicedChunkProducer<P, F, I>
+where
+    P: ChunkProducer + 'static,
+    F: FnOnce() -> P + Send + 'static,
+    I: Iterator<Item = F> + Send,
+{
+    type Chunk = P::Chunk;
+
+    fn try_dyn_resize(&mut self, requested_size: usize) -> DynamicProducers<P::Chunk> {
+        let mut res = Vec::with_capacity(requested_size);
+        for _ in 0..requested_size {
+            let value = self.slices.next();
+            match value {
+                None => {
+                    eprintln!("Requested resize is larger than the amount of slices");
+                    return res;
+                }
+                Some(f) => {
+                    res.push(Box::new(move || {
+                        Box::new(SimpleDynamicWrapperChunkProducer::new(
+                            f
+                        )) as Box<dyn ChunkProducer<Chunk = P::Chunk>>
+                    }) as _)
+                }
+            }
+        }
+        res
+    }
+
+    fn get_chunk(&mut self, chunk: &mut Self::Chunk) -> Result<bool> {
+        self.ensure_init();
+        self.inner.as_mut().unwrap().get_chunk(chunk)
+    }
+
+    fn next_file(&mut self) -> Result<bool> {
+        self.ensure_init();
+        self.inner.as_mut().unwrap().next_file()
+    }
+}
+
+pub struct SimpleDynamicWrapperChunkProducer<P, F>
+where
+    P: ChunkProducer + 'static,
+    F: FnOnce() -> P + Send,
+{
+    inner: Option<P>,   // becomes Some(P) after first get_chunk
+    factory: Option<F>, // removed after calling it
+}
+
+impl<P, F> SimpleDynamicWrapperChunkProducer<P, F>
+where
+    P: ChunkProducer + 'static,
+    F: FnOnce() -> P + Send,
+{
+    pub fn new(f: F) -> Self {
+        SimpleDynamicWrapperChunkProducer {
+            inner: None,
+            factory: Some(f),
+        }
+    }
+
+    fn ensure_init(&mut self) {
+        if self.inner.is_none() {
+            // Take F out, call it, initialize inner P
+            let f = self.factory.take().expect("factory missing");
+            self.inner = Some(f());
+        }
+    }
+}
+
+impl<P, F> ChunkProducer for SimpleDynamicWrapperChunkProducer<P, F>
+where
+    P: ChunkProducer + 'static,
+    F: FnOnce() -> P + Send,
+{
+    type Chunk = P::Chunk;
+
+    fn get_chunk(&mut self, chunk: &mut Self::Chunk) -> Result<bool> {
+        self.ensure_init();
+        self.inner.as_mut().unwrap().get_chunk(chunk)
+    }
+
+    fn next_file(&mut self) -> Result<bool> {
+        self.ensure_init();
+        self.inner.as_mut().unwrap().next_file()
+    }
+
+    fn try_dyn_resize(&mut self, requested_size: usize)
+                      -> DynamicProducers<Self::Chunk>
+    {
+        self.ensure_init();
+        self.inner.as_mut().unwrap().try_dyn_resize(requested_size)
+    }
 }
 
 impl<P: ChunkProducer + 'static> ShardedChunkProducer<P> {
@@ -637,7 +779,7 @@ impl<P: ChunkProducer + 'static> ShardedChunkProducer<P> {
 
 impl<P: ChunkProducer + 'static> ChunkProducer for ShardedChunkProducer<P> {
     type Chunk = P::Chunk;
-    fn try_dyn_resize(&self, requested_size: usize) -> DynamicProducers<P::Chunk> {
+    fn try_dyn_resize(&mut self, requested_size: usize) -> DynamicProducers<P::Chunk> {
         let mut res = Vec::with_capacity(requested_size);
         for _ in 0..requested_size {
             let incoming = self.incoming.clone();
@@ -690,7 +832,7 @@ impl<P: ChunkProducer + 'static> ChunkProducer for CancellableChunkProducer<P> {
 
     // TODO this API means we have two layers of virtual dispatch, which isn't great.
     // It's not the end of the world, but we should think about whether there is a way around this.
-    fn try_dyn_resize(&self, requested_size: usize) -> DynamicProducers<P::Chunk> {
+    fn try_dyn_resize(&mut self, requested_size: usize) -> DynamicProducers<P::Chunk> {
         let children = self.prod.try_dyn_resize(requested_size);
         let mut res = Vec::with_capacity(children.len());
         for factory in children.into_iter() {
@@ -876,7 +1018,7 @@ mod tests {
     #[test]
     fn parallel_all_elements() {
         use std::{sync::Mutex, thread};
-        let parallel_producer =
+        let mut parallel_producer =
             ParallelChunkProducer::new(new_iter(0, 100, "file1"), /*chan_size=*/ 10);
         let got = Arc::new(Mutex::new(Vec::new()));
         let threads = {
@@ -911,7 +1053,7 @@ mod tests {
     #[test]
     fn sharded_all_elements() {
         use std::{sync::Mutex, thread};
-        let sharded_producer = ShardedChunkProducer::new(
+        let mut sharded_producer = ShardedChunkProducer::new(
             vec![
                 new_iter(0, 10, "file1"),
                 new_iter(10, 20, "file2"),

@@ -279,7 +279,7 @@ fn valid_lhs<I>(e: &ast::Expr<I>) -> bool {
 }
 
 #[derive(Debug)]
-pub(crate) struct ProgramContext<'a, I> {
+pub(crate) struct ProgramContext<'a, I: Eq+Clone+Hash+fmt::Debug> {
     pub shared: GlobalContext<I>,
     // Functions "know" which Option<Ident> maps to which offset in this
     // table at construction time (in the func_table passed to View).
@@ -293,9 +293,10 @@ pub(crate) struct ProgramContext<'a, I> {
     // Thread through information regarding header columns used.
     pub parse_header: bool,
     pub can_parallelize: bool,
+    pub parallelization_variables: Option<HashMap<Ident, HashSet<(GlobalVar<'a, I>, ParallelOp)>>>,
 }
 
-impl<'a, I> ProgramContext<'a, I> {
+impl<'a, I: Eq+Clone+Hash+fmt::Debug> ProgramContext<'a, I> {
     pub fn main_stage(&self) -> &Stage<usize> {
         &self.main_offset
     }
@@ -494,28 +495,31 @@ where
             f.ret = ret;
             funcs.push(f);
         }
-        for dec in &p.decs {
-            println!("{:#?}", dec);
-        }
+        // for dec in &p.decs {
+        //     println!("{:#?}", dec);
+        // }
+        //
+        // // Print begin statements
+        // for stmt in &p.begin {
+        //     println!("{:#?}", stmt);
+        // }
+        //
+        // // Print pats
+        // for (pat, maybe_stmt) in &p.pats {
+        //     println!("pat = {:#?}, stmt = {:?}", pat, maybe_stmt);
+        // }
 
-        // Print begin statements
-        for stmt in &p.begin {
-            println!("{:#?}", stmt);
-        }
+        //
 
-        // Print pats
-        for (pat, maybe_stmt) in &p.pats {
-            println!("pat = {:#?}, stmt = {:?}", pat, maybe_stmt);
-        }
         let mut vars_with_assign = find_global::find_global(&p);
-        println!("Variables changed in the main loop: {:#?}", vars_with_assign);
+        // println!("Variables changed in the main loop: {:#?}", vars_with_assign);
         let parallelization;
         if !vars_with_assign.0 {
-            parallelization = (false, std::collections::HashMap::<GlobalVar<I>, ParallelOp>::new());
+            parallelization = (false, HashMap::new());
         } else {
             parallelization = check_parallelizability(&p, &vars_with_assign.1);
         }
-        println!("Parallelization check results: {:#?}", parallelization);
+        // println!("Parallelization check results: {:#?}", parallelization);
 
         // Now that we have all the functions in place, it's time to fill them up and convert them
         // to SSA.
@@ -584,7 +588,29 @@ where
                 }
             }
         };
-        // eprintln!("{:#?}", shared);
+
+        //
+
+        let mut parallelization_variables = None;
+
+        if parallelization.0 {
+            let mut variables = HashMap::new();
+            for (global_var, op) in parallelization.1 {
+                let name = match &global_var {
+                    GlobalVar::Scalar(i) => i,
+                    GlobalVar::ArrayExact(i, _) => i,
+                    GlobalVar::ArrayUnknown(i) => i,
+                };
+                if let Some(ident) = shared.hm.get(name) {
+                    variables.entry(*ident).or_insert(HashSet::new()).insert((global_var, op));
+                }
+            }
+            parallelization_variables = Some(variables);
+        }
+
+        //
+
+        // eprintln!("Parallelization variables: {:#?}", parallelization_variables);
         let context = ProgramContext {
             shared,
             funcs,
@@ -593,11 +619,8 @@ where
             fold_regex_constants: false,
             parse_header: p.parse_header,
             can_parallelize: parallelization.0,
+            parallelization_variables,
         };
-        // let (parallelizable_dependencies, vars_dependent_on_global) = check_global_variable_dependency(&vars_with_assingm, &context);
-        // if !parallelizable_dependencies {context.can_parallelize = false;}
-        // let res = check_parallelization(&vars_with_assingm, &vars_dependent_on_global, &context);
-        // eprintln!("Is parallelizable: {:?}", res);
         Ok(context)
     }
 }

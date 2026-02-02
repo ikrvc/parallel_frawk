@@ -1,22 +1,23 @@
 use crate::builtins::Variable;
 use crate::bytecode::{Get, Instr, Label, Reg};
-use crate::common::{NumTy, Result, Stage};
+use crate::common::{Either, NumTy, Result, Stage};
 use crate::compile::{self, Ty};
 use crate::pushdown::FieldSet;
 use crate::runtime::{self, Float, Int, Line, LineReader, Str, UniqueStr};
 
 use crossbeam::scope;
 use crossbeam_channel::bounded;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use rand::{self, rngs::StdRng, Rng, SeedableRng};
 use regex::bytes::Regex;
-
 use std::cmp;
 use std::mem;
+use crate::parallelization::ast_check_parallelization::ParallelOp;
+use crate::parallelization::find_global::IndexVal;
 
 type ClassicReader = runtime::splitter::regex::RegexSplitter<Box<dyn std::io::Read>>;
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub(crate) struct Storage<T> {
     pub(crate) regs: Vec<T>,
     pub(crate) stack: Vec<T>,
@@ -46,7 +47,7 @@ impl<'a> Drop for Core<'a> {
 /// "slots". These aren't normal registers, because slots store `Send` variants of the frawk
 /// runtime types; making the value safe for sending between threads may involve performing a
 /// deep copy.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub(crate) struct Slots {
     pub int: Vec<Int>,
     pub float: Vec<Float>,
@@ -65,11 +66,21 @@ trait Agg {
 }
 impl Agg for Int {
     fn agg(self, other: Int) -> Int {
+        // if other == 0 {
+        //     self
+        // } else {
+        //     other
+        // }
         self + other
     }
 }
 impl Agg for Float {
     fn agg(self, other: Float) -> Float {
+        // if other == 0.0 {
+        //     self
+        // } else {
+        //     other
+        // }
         self + other
     }
 }
@@ -83,6 +94,177 @@ impl<'a> Agg for UniqueStr<'a> {
         }
     }
 }
+
+trait ParallelAgg {
+    fn par_agg(self, other: Self, parallel_op:  &Either<HashSet<(IndexVal, ParallelOp)>, ParallelOp>) -> Self;
+}
+
+trait ConvertIndex: Sized {
+    fn convert_index_to_the_type(indexVal: &IndexVal) -> Self;
+}
+
+fn extract_parrallel_op_simple(parallel_op:  &Either<HashSet<(IndexVal, ParallelOp)>, ParallelOp>) -> ParallelOp {
+    match parallel_op {
+        Either::Left(set) => {panic!("HashSet ParallelOp for a simple scenario")}
+        Either::Right(op) => {op.clone()}
+    }
+}
+
+const UNDEFINED_BITS: u64 = 0x7FF8_0000_0000_0001;
+const UNDEFINED_INT: i64 = i64::MIN + 42;
+
+impl ParallelAgg for Int {
+    fn par_agg(self, other: Int, parallel_op:  &Either<HashSet<(IndexVal, ParallelOp)>, ParallelOp>) -> Int {
+        let parallel_op = extract_parrallel_op_simple(parallel_op);
+        match parallel_op {
+            ParallelOp::Plus => self + other,
+            ParallelOp::Mult => self * other,
+            ParallelOp::And => {
+                if self == 0 || other == 0 { 0 } else if self == 1 || other == 1 { 1 } else { self }
+            },
+            ParallelOp::Or => {
+                if self == 0 && other == 0 { 0 } else if self == 1 || other == 1 { 1 } else { self }
+            }
+            ParallelOp::LastAssigned => {
+                if other == UNDEFINED_INT {
+                    self
+                } else {
+                    other
+                }
+            }
+            ParallelOp::Concat => panic!("Concatenation of Integer values should not be possible")
+        }
+    }
+}
+
+impl ConvertIndex for Int {
+    fn convert_index_to_the_type(indexVal: &IndexVal) -> Int {
+        match indexVal {
+            IndexVal::IntLit(i) => i.clone(),
+            IndexVal::StrLit(l) => runtime::convert::<_, Int>(Str::from(l.clone())),
+            IndexVal::PatLit(l) => panic!("Pattern index conversion into int is undefined")
+        }
+    }
+}
+
+impl<'a> ConvertIndex for UniqueStr<'static> {
+    fn convert_index_to_the_type(indexVal: &IndexVal) -> UniqueStr<'static> {
+        match indexVal {
+            IndexVal::IntLit(i) => runtime::convert::<_, Str>(i.clone()).into(),
+            IndexVal::StrLit(l) => Str::from(l.clone()).unmoor().into(),
+            IndexVal::PatLit(l) => panic!("Pattern index conversion into str is undefined")
+        }
+    }
+}
+
+impl ParallelAgg for Float {
+    fn par_agg(self, other: Float, parallel_op: &Either<HashSet<(IndexVal, ParallelOp)>, ParallelOp>) -> Float {
+        let parallel_op = extract_parrallel_op_simple(parallel_op);
+        match parallel_op {
+            ParallelOp::Plus => self + other,
+            ParallelOp::Mult => self * other,
+            ParallelOp::And => {
+                if self == 0.0 || other == 0.0 {0.0}
+                else if self == 1.0 || other == 1.0 {1.0}
+                else {self}
+            },
+            ParallelOp::Or => {
+                if self == 0.0 && other == 0.0 {0.0}
+                else if self == 1.0 || other == 1.0 {1.0}
+                else {self}
+            }
+            ParallelOp::LastAssigned => {
+                if other.to_bits() == UNDEFINED_BITS {
+                    self
+                } else {
+                    other
+                }
+            }
+            ParallelOp::Concat => panic!("Concatenation of Integer values should not be possible")
+        }
+    }
+}
+
+impl<'a> ParallelAgg for UniqueStr<'a> {
+    fn par_agg(self, other: UniqueStr<'a>, parallel_op: &Either<HashSet<(IndexVal, ParallelOp)>, ParallelOp>) -> UniqueStr<'a> {
+        let parallel_op = extract_parrallel_op_simple(parallel_op);
+        let val = self.into_str();
+        let other = other.into_str();
+        match parallel_op {
+            a @ ParallelOp::Plus | a @ ParallelOp::Mult => {
+                let mut val = runtime::convert::<_, Float>(val);
+                let val2 = runtime::convert::<_, Float>(other);
+                match a {
+                    ParallelOp::Plus => {val += val2}
+                    ParallelOp::Mult => {val *= val2}
+                    _ => {}
+                }
+                Str::from(val).into()
+            }
+            ParallelOp::And => {
+                if val.is_empty() || other.is_empty() {
+                    Str::from("").into()
+                } else if val == Str::from("1") || other == Str::from("1") {
+                    Str::from("1").into()
+                } else {
+                    other.into()
+                }
+            }
+            ParallelOp::Or => {
+                if val.is_empty() && other.is_empty() {
+                    Str::from("").into()
+                } else if val == Str::from("1") || other == Str::from("1") {
+                    Str::from("1").into()
+                } else {
+                    val.into()
+                }
+            }
+            ParallelOp::LastAssigned => {
+                if other.is_undefined() {
+                    UniqueStr::from(val)
+                } else {
+                    other.into()
+                }
+            }
+            ParallelOp::Concat => {
+                let str = Str::concat(val, other).into();
+                str
+            },
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + ConvertIndex, V: ParallelAgg + Default> ParallelAgg for HashMap<K, V> { //take a deeper look into this one
+    fn par_agg(mut self, other: HashMap<K, V>, parallel_op: &Either<HashSet<(IndexVal, ParallelOp)>, ParallelOp>) -> HashMap<K, V> {
+        match parallel_op {
+            Either::Left(set) => {
+                let mut other = other;
+                for (index, op) in set.iter() {
+                    let key = K::convert_index_to_the_type(index);
+                    let val2 = other.remove(&key);
+                    match val2 {
+                        Some(val2) => {
+                            let entry = self.entry(key).or_default(); // this one should be adjusted in case of undefined
+                            let v2 = mem::take(entry);
+                            *entry = v2.par_agg(val2, &Either::Right(op.clone()));
+                        }
+                        None => {continue}
+                    }
+                }
+                self
+            }
+            a@ Either::Right(_) => {
+                for (k, v) in other {
+                    let entry = self.entry(k).or_default(); // this one should be adjusted in case of undefined
+                    let v2 = mem::take(entry);
+                    *entry = v2.par_agg(v, a);
+                }
+                self
+            }
+        }
+    }
+}
+
 impl<K: std::hash::Hash + Eq, V: Agg + Default> Agg for HashMap<K, V> {
     fn agg(mut self, other: HashMap<K, V>) -> HashMap<K, V> {
         for (k, v) in other {
@@ -97,11 +279,22 @@ impl<K: std::hash::Hash + Eq, V: Agg + Default> Agg for HashMap<K, V> {
 /// StageResult is a Send subset of Core that can be extracted for inter-stage aggregation in a
 /// parallel script.
 pub(crate) struct StageResult {
-    slots: Slots,
+    pub slots: Slots,
     // TODO: put more variables in here? Most builtin variables are just going to be propagated
     // from the initial thread.
     nr: Int,
     rc: i32,
+}
+
+impl StageResult {
+    pub fn combine_parallel(&mut self, StageResult { mut slots, nr, rc: _ }: StageResult, parallelization_slots: &Option<HashMap<(Ty, usize), Either<HashSet<(IndexVal, ParallelOp)>, ParallelOp>>>) {
+        self.combine_parallel_slots(slots, parallelization_slots);
+        self.nr = self.nr.agg(nr);
+    }
+    
+    pub fn combine_parallel_slots(&mut self, mut slots: Slots, parallelization_slots: &Option<HashMap<(Ty, usize), Either<HashSet<(IndexVal, ParallelOp)>, ParallelOp>>>) {
+        self.slots.combine_parallel(&mut slots, parallelization_slots);
+    }
 }
 
 impl Slots {
@@ -128,9 +321,67 @@ impl Slots {
             }
         });
     }
+
+    pub fn combine_parallel(
+        &mut self,
+        other: &mut Slots,
+        parallelization_slots: &Option<HashMap<(Ty, usize), Either<HashSet<(IndexVal, ParallelOp)>, ParallelOp>>>
+    ) {
+        let get_op = |ty: Ty, idx: usize| {
+            if let Some(map) = parallelization_slots {
+                if let Some(e) = map.get(&(ty, idx)) {
+                    return e;
+                }
+            }
+            &Either::Right(ParallelOp::LastAssigned)
+        };
+
+        macro_rules! for_each_slot_pair {
+            ($s1:ident, $s2:ident, $body:expr) => {
+                for_each_slot_pair!(
+                    $s1, $s2, $body,
+                    int => Ty::Int,
+                    float => Ty::Float,
+                    strs => Ty::Str,
+                    intint => Ty::MapIntInt,
+                    intfloat => Ty::MapIntFloat,
+                    intstr => Ty::MapIntStr,
+                    strint => Ty::MapStrInt,
+                    strfloat => Ty::MapStrFloat,
+                    strstr => Ty::MapStrStr
+                );
+            };
+            ($s1:ident, $s2:ident, $body:expr, $($fld:tt => $tag:expr),*) => {$({
+                let $s1 = &mut self.$fld;
+                let $s2 = &mut other.$fld;
+
+                let slot_ty = $tag;
+
+                $body(slot_ty);
+            })*};
+        }
+
+        for_each_slot_pair!(a, b, |ty: Ty| {
+            a.resize_with(std::cmp::max(a.len(), b.len()), Default::default);
+            for (slot_index, (a_elt, b_elt_v)) in a.iter_mut().zip(b.drain(..)).enumerate() {
+                let a_elt_v = mem::take(a_elt);
+                *a_elt = a_elt_v.par_agg(b_elt_v, get_op(ty, slot_index));
+            }
+        });
+
+    }
 }
 
 pub fn set_slot<T: Default>(vec: &mut Vec<T>, slot: usize, v: T) {
+    if slot < vec.len() {
+        vec[slot] = v;
+        return;
+    }
+    vec.resize_with(slot, Default::default);
+    vec.push(v)
+}
+
+pub fn set_slot_if_defined<T: Default>(vec: &mut Vec<T>, slot: usize, v: T) {
     if slot < vec.len() {
         vec[slot] = v;
         return;
@@ -215,6 +466,16 @@ impl<'a> Core<'a> {
     pub fn combine(&mut self, StageResult { slots, nr, rc: _ }: StageResult) {
         self.slots.combine(slots);
         self.vars.nr = self.vars.nr.agg(nr);
+    }
+    
+    pub fn combine_parallel(&mut self, mut stage_result: StageResult, parallelization_slots: &Option<HashMap<(Ty, usize), Either<HashSet<(IndexVal, ParallelOp)>, ParallelOp>>>) {
+        self.slots.combine_parallel(&mut stage_result.slots, parallelization_slots);
+        self.vars.nr = self.vars.nr.agg(stage_result.nr);
+    }
+
+    pub fn apply_initial_values(&mut self, mut slots: Slots, parallelization_slots: &Option<HashMap<(Ty, usize), Either<HashSet<(IndexVal, ParallelOp)>, ParallelOp>>>) {
+        slots.combine_parallel(&mut self.slots, parallelization_slots);
+        self.slots = slots;
     }
 
     pub fn reseed(&mut self, seed: u64) -> u64 /* old seed */ {
@@ -334,6 +595,234 @@ impl<'a> Core<'a> {
             }),
         )
     }
+    
+    pub fn change_state_for_parallelization(&mut self, globals:
+    &HashMap<(Ty, usize), Either<HashSet<(IndexVal, ParallelOp)>, ParallelOp>>) -> Slots {
+        let resulting_slots = self.slots.clone();
+
+        for ((t, slot), op) in globals {
+            match op {
+                Either::Right(op) => {
+                    match op {
+                        ParallelOp::Plus => {
+                            match t {
+                                Ty::Int => set_slot_if_defined(&mut self.slots.int, *slot, 0),
+                                Ty::Float => set_slot_if_defined(&mut self.slots.float, *slot, 0.0),
+                                Ty::Str => {
+                                    let empty = Str::from("").unmoor();
+                                    set_slot_if_defined(&mut self.slots.strs, *slot, empty.into());
+                                }
+                                Ty::MapIntInt => set_slot_if_defined(&mut self.slots.intint, *slot, Default::default()),
+                                Ty::MapIntFloat => set_slot_if_defined(&mut self.slots.intfloat, *slot, Default::default()),
+                                Ty::MapIntStr => set_slot_if_defined(&mut self.slots.intstr, *slot, Default::default()),
+                                Ty::MapStrInt => set_slot_if_defined(&mut self.slots.strint, *slot, Default::default()),
+                                Ty::MapStrFloat => set_slot_if_defined(&mut self.slots.strfloat, *slot, Default::default()),
+                                Ty::MapStrStr => set_slot_if_defined(&mut self.slots.strstr, *slot, Default::default()),
+                                _ => {}
+                            }
+                        }
+                        ParallelOp::Mult => {
+                            match t {
+                                Ty::Int => set_slot_if_defined(&mut self.slots.int, *slot, 1),
+                                Ty::Float => set_slot_if_defined(&mut self.slots.float, *slot, 1.0),
+                                Ty::Str => {
+                                    let one = Str::from("1").unmoor();
+                                    set_slot_if_defined(&mut self.slots.strs, *slot, one.into());
+                                }
+                                Ty::MapIntInt => {
+                                    if let Some(map) = self.slots.intint.get_mut(*slot) {
+                                        for (_k, v) in map.iter_mut() {
+                                            *v = 1;
+                                        }
+                                    }
+                                }
+                                Ty::MapIntFloat => {
+                                    if let Some(map) = self.slots.intfloat.get_mut(*slot) {
+                                        for (_k, v) in map.iter_mut() {
+                                            *v = 1.0;
+                                        }
+                                    }
+                                }
+                                Ty::MapIntStr => {
+                                    if let Some(map) = self.slots.intstr.get_mut(*slot) {
+                                        let one: UniqueStr = Str::from("1").unmoor().into();
+                                        for (_k, v) in map.iter_mut() {
+                                            *v = one.clone();
+                                        }
+                                    }
+                                }
+                                Ty::MapStrInt => {
+                                    if let Some(map) = self.slots.strint.get_mut(*slot) {
+                                        for (_k, v) in map.iter_mut() {
+                                            *v = 1;
+                                        }
+                                    }
+                                }
+                                Ty::MapStrFloat => {
+                                    if let Some(map) = self.slots.strfloat.get_mut(*slot) {
+                                        for (_k, v) in map.iter_mut() {
+                                            *v = 1.0;
+                                        }
+                                    }
+                                }
+                                Ty::MapStrStr => {
+                                    if let Some(map) = self.slots.strstr.get_mut(*slot) {
+                                        let one: UniqueStr = Str::from("1").unmoor().into();
+                                        for (_k, v) in map.iter_mut() {
+                                            *v = one.clone();
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        ParallelOp::Concat => {
+                            match t {
+                                Ty::Str => {
+                                    let empty = Str::from("").unmoor();
+                                    set_slot_if_defined(&mut self.slots.strs, *slot, empty.into());
+                                }
+                                Ty::Float | Ty::Int => panic!("Concat operation is applied to float/int variable, should not be the case"),
+                                Ty::MapIntStr => set_slot_if_defined(&mut self.slots.intstr, *slot, Default::default()),
+                                Ty::MapStrStr => set_slot_if_defined(&mut self.slots.strstr, *slot, Default::default()),
+                                _ => {panic!("Concat operation is applied to float/int map values, should not be the case")}
+                            }
+                        }
+                        ParallelOp::LastAssigned => {
+                            match t {
+                                Ty::Int => set_slot_if_defined(&mut self.slots.int, *slot, UNDEFINED_INT),
+                                Ty::Float => set_slot_if_defined(&mut self.slots.float, *slot, f64::from_bits(UNDEFINED_BITS)),
+                                Ty::Str => set_slot_if_defined(&mut self.slots.strs, *slot, UniqueStr::from(Str::new_undefined())),
+                                Ty::MapIntInt => set_slot_if_defined(&mut self.slots.intint, *slot, Default::default()),
+                                Ty::MapIntFloat => set_slot_if_defined(&mut self.slots.intfloat, *slot, Default::default()),
+                                Ty::MapIntStr => set_slot_if_defined(&mut self.slots.intstr, *slot, Default::default()),
+                                Ty::MapStrInt => set_slot_if_defined(&mut self.slots.strint, *slot, Default::default()),
+                                Ty::MapStrFloat => set_slot_if_defined(&mut self.slots.strfloat, *slot, Default::default()),
+                                Ty::MapStrStr => set_slot_if_defined(&mut self.slots.strstr, *slot, Default::default()),
+                                _ => {panic!("Incorrect type for last assigned operation")}
+                            }
+                        }
+                        _ => {} // leave as is for other operators
+                    }
+                }
+                Either::Left(hashset) => {
+                    match t {
+                        Ty::MapIntInt => {
+                            let map_opt = self.slots.intint.get_mut(*slot);
+                            if map_opt.is_none() {continue}
+                            let map = map_opt.unwrap();
+                            for (index_val, op) in hashset {
+                                let i = Int::convert_index_to_the_type(index_val);
+                                match op {
+                                    ParallelOp::Plus => { map.insert(i, 0); }
+                                    ParallelOp::Mult => { map.insert(i, 1); }
+                                    ParallelOp::LastAssigned => { map.remove(&i); }
+                                    ParallelOp::Concat => {panic!("Concat for intint map")}
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Ty::MapIntFloat => {
+                            let map_opt = self.slots.intfloat.get_mut(*slot);
+                            if map_opt.is_none() {continue}
+                            let map = map_opt.unwrap();
+                            for (index_val, op) in hashset {
+                                let i = Int::convert_index_to_the_type(index_val);
+                                match op {
+                                    ParallelOp::Plus => { map.insert(i, 0.0); }
+                                    ParallelOp::Mult => { map.insert(i, 1.0); }
+                                    ParallelOp::LastAssigned => { map.remove(&i); }
+                                    ParallelOp::Concat => {panic!("Concat for intfloat map")}
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Ty::MapIntStr => {
+                            let map_opt = self.slots.intstr.get_mut(*slot);
+                            if map_opt.is_none() {continue}
+                            let map = map_opt.unwrap();
+                            for (index_val, op) in hashset {
+                                let i = Int::convert_index_to_the_type(index_val);
+                                match op {
+                                    ParallelOp::Plus => {
+                                        let empty = Str::from("").into();
+                                        map.insert(i, empty);
+                                    }
+                                    ParallelOp::Mult => {
+                                        let one = Str::from("1").into();
+                                        map.insert(i, one);
+                                    }
+                                    ParallelOp::Concat => {
+                                        let empty = Str::from("").into();
+                                        map.insert(i, empty);
+                                    }
+                                    ParallelOp::LastAssigned => { map.remove(&i); }
+                                    _ => {}
+                                }
+
+                            }
+                        }
+                        Ty::MapStrInt => {
+                            let map_opt = self.slots.strint.get_mut(*slot);
+                            if map_opt.is_none() {continue}
+                            let map = map_opt.unwrap();
+                            for (index_val, op) in hashset {
+                                let key = UniqueStr::convert_index_to_the_type(index_val);
+                                match op {
+                                    ParallelOp::Plus => { map.insert(key, 0); }
+                                    ParallelOp::Mult => { map.insert(key, 1); }
+                                    ParallelOp::LastAssigned => { map.remove(&key); }
+                                    ParallelOp::Concat => {panic!("Concat for strint map")}
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Ty::MapStrFloat => {
+                            let map_opt = self.slots.strfloat.get_mut(*slot);
+                            if map_opt.is_none() {continue}
+                            let map = map_opt.unwrap();
+                            for (index_val, op) in hashset {
+                                let key = UniqueStr::convert_index_to_the_type(index_val);
+                                match op {
+                                    ParallelOp::Plus => { map.insert(key, 0.0); }
+                                    ParallelOp::Mult => { map.insert(key, 1.0); }
+                                    ParallelOp::LastAssigned => { map.remove(&key); }
+                                    ParallelOp::Concat => {panic!("Concat for strfloat map")}
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Ty::MapStrStr => {
+                            let map_opt = self.slots.strstr.get_mut(*slot);
+                            if map_opt.is_none() {continue}
+                            let map = map_opt.unwrap();
+                            for (index_val, op) in hashset {
+                                let key = UniqueStr::convert_index_to_the_type(index_val);
+                                match op {
+                                    ParallelOp::Plus => {
+                                        let empty = Str::default().into();
+                                        map.insert(key, empty);
+                                    }
+                                    ParallelOp::Mult => {
+                                        let one = Str::from("1").into();
+                                        map.insert(key, one);
+                                    }
+                                    ParallelOp::Concat => {
+                                        let empty = Str::from("").into();
+                                        map.insert(key, empty);
+                                    }
+                                    ParallelOp::LastAssigned => { map.remove(&key); }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {} // non-map types handled in Right
+                    }
+                }
+            }
+        }
+        resulting_slots
+    }
 }
 
 macro_rules! map_regs {
@@ -434,6 +923,8 @@ pub(crate) struct Interp<'a, LR: LineReader = ClassicReader> {
 
     pub(crate) iters_int: Storage<runtime::Iter<Int>>,
     pub(crate) iters_str: Storage<runtime::Iter<Str<'a>>>,
+
+    parallelization_slots: Option<HashMap<(Ty, usize), Either<HashSet<(IndexVal<'a>, ParallelOp)>, ParallelOp>>>,
 }
 
 fn default_of<T: Default>(n: usize) -> Storage<T> {
@@ -455,6 +946,7 @@ impl<'a, LR: LineReader> Interp<'a, LR> {
         ff: impl runtime::writers::FileFactory,
         used_fields: &FieldSet,
         named_columns: Option<Vec<&[u8]>>,
+        parallelization_slots: Option<HashMap<(Ty, usize), Either<HashSet<(IndexVal<'a>, ParallelOp)>, ParallelOp>>>
     ) -> Self {
         use compile::Ty::*;
         Interp {
@@ -480,6 +972,8 @@ impl<'a, LR: LineReader> Interp<'a, LR> {
 
             iters_int: default_of(regs(IterInt)),
             iters_str: default_of(regs(IterStr)),
+
+            parallelization_slots
         }
     }
 
@@ -531,6 +1025,7 @@ impl<'a, LR: LineReader> Interp<'a, LR> {
                 return Ok(rc);
             }
         }
+        eprintln!("Interpreter after begin: {:?}, {:?}", self.maps_int_int, self.ints);
         if self.core.write_files.flush_stdout().is_err() {
             return Ok(1);
         }
@@ -584,6 +1079,7 @@ impl<'a, LR: LineReader> Interp<'a, LR> {
                             maps_str_str: default_of(maps_str_str_size),
                             iters_int: default_of(iters_int_size),
                             iters_str: default_of(iters_str_size),
+                            parallelization_slots: None
                         };
                         let res = interp.run_at(main_loop);
 

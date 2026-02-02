@@ -1,12 +1,17 @@
-use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
+use hashbrown::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
 use crate::ast;
 use crate::ast::{Expr, Stmt};
-use crate::parallelization::ast_check_parallelization::{valid_lhs};
+use crate::builtins::Function;
+use crate::common::Either;
+use crate::parallelization::ast_check_parallelization::{define_builtin, valid_lhs};
 use crate::parallelization::find_global::{GlobalVar, IndexVal};
 
-pub fn find_truly_globals<'a, 'b, I: Clone + Hash + Eq+Debug>(program: &ast::Prog<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'a, I>>) -> HashSet<GlobalVar<'a, I>> {
+pub fn find_truly_globals<'a, 'b, I: Clone + Hash + Eq+Debug>(program: &ast::Prog<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'a, I>>) -> HashSet<GlobalVar<'a, I>>
+where Function: TryFrom<I>
+{
     let mut truly_globals = HashSet::new();
     let mut usages = HashMap::new();
     for (_, maybe_stmt) in &program.pats {
@@ -34,12 +39,16 @@ pub fn find_truly_globals<'a, 'b, I: Clone + Hash + Eq+Debug>(program: &ast::Pro
         }
 
     }
-    println!("Truly globals: {:?}", truly_globals);
+    // println!("Truly globals: {:?}", truly_globals);
     truly_globals
 }
 
-fn check_statement_for_locality<'a, I: Clone + Hash + Eq+Debug>(stmt: &Stmt<'_, 'a, I>, global_vars: &HashSet<GlobalVar<'a, I>>, usages: &mut HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>, truly_globals: &mut HashSet<GlobalVar<'a, I>>, dependency_stack: &mut Vec<HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>>) {
+fn check_statement_for_locality<'a, I: Clone + Hash + Eq+Debug>(stmt: &Stmt<'_, 'a, I>, global_vars: &HashSet<GlobalVar<'a, I>>, usages: &mut HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>, truly_globals: &mut HashSet<GlobalVar<'a, I>>, dependency_stack: &mut Vec<HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>>)
+where Function: TryFrom<I>
+{
     match stmt {
+        Stmt::Continue | Stmt::Break | Stmt::Next | Stmt::NextFile => return,
+        Stmt::EndCond(_) | Stmt::StartCond(_) | Stmt::LastCond(_) => return,
         Stmt::Expr(expr) => {check_expression_for_locality(expr, global_vars, usages, truly_globals, dependency_stack);},
         Stmt::Block(vec) => {
             for stmt in vec {
@@ -90,19 +99,34 @@ fn check_statement_for_locality<'a, I: Clone + Hash + Eq+Debug>(stmt: &Stmt<'_, 
             check_statement_for_locality(stmt, global_vars, usages, truly_globals, dependency_stack);
             dependency_stack.pop();
         }
-        Stmt::Print(expressions, spec) => {  // file spec is not implemented here
-            if let Some(_) = spec {
-                panic!("Not implemented exception in check statement parallelizability: print with file spec");
-            }
+        Stmt::Print(expressions, spec) => {
             for expr in expressions.iter() {
                 check_expression_for_locality(expr, global_vars, usages, truly_globals, dependency_stack);
             }
+            if let Some((e, _)) = spec {
+                check_expression_for_locality(e, global_vars, usages, truly_globals, dependency_stack);
+            }
         }
-        _ => panic!("Not implemented exception in local detection for statement")
+        Stmt::Printf(exp,variables,  spec) => {
+            check_expression_for_locality(exp, global_vars, usages, truly_globals, dependency_stack);
+            for expr in variables.iter() {
+                check_expression_for_locality(expr, global_vars, usages, truly_globals, dependency_stack);
+            }
+            if let Some((e, _)) = spec {
+                check_expression_for_locality(e, global_vars, usages, truly_globals, dependency_stack);
+            }
+        }
+        Stmt::Return(val) => {
+            if let Some(expr) = val {
+                check_expression_for_locality(expr, global_vars, usages, truly_globals, dependency_stack);
+            }
+        }
     }
 }
 
-fn check_expression_for_locality<'a, I: Clone + Hash + Eq+Debug>(expr: &Expr<'_, 'a, I>, global_vars: &HashSet<GlobalVar<'a, I>>, usages: &mut HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>, truly_globals: &mut HashSet<GlobalVar<'a, I>>, dependency_stack: &mut Vec<HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>>) -> HashSet<GlobalVar<'a, I>> {
+fn check_expression_for_locality<'a, I: Clone + Hash + Eq+Debug>(expr: &Expr<'_, 'a, I>, global_vars: &HashSet<GlobalVar<'a, I>>, usages: &mut HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>, truly_globals: &mut HashSet<GlobalVar<'a, I>>, dependency_stack: &mut Vec<HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>>) -> HashSet<GlobalVar<'a, I>>
+where Function: TryFrom<I>,
+{
     match expr {
         Expr::ILit(..) => HashSet::new(),
         Expr::FLit(..) => HashSet::new(),
@@ -270,7 +294,29 @@ fn check_expression_for_locality<'a, I: Clone + Hash + Eq+Debug>(expr: &Expr<'_,
 
         },
 
-        _ => panic!("Not implemented exception")
+        //check what are these later
+        Expr::ReadStdin => HashSet::new(),
+        Expr::Getline { .. } => HashSet::new(),
+        Expr::Cond(_) => HashSet::new(),
+        Expr::Call(func, args) => {
+            let mut res = HashSet::new();
+            let func = define_builtin(func);
+            match func {
+                Either::Left(_) => {}
+                Either::Right(func) => {
+                    // match func {
+                    //     Function::Split => {
+                    //
+                    //     }
+                    // }
+                }
+            }
+            for arg in args.iter() {
+                res.extend(check_expression_for_locality(arg, global_vars, usages, truly_globals, dependency_stack));
+            }
+            res
+        }
+        // _ => panic!("Not implemented exception")
     }
 }
 

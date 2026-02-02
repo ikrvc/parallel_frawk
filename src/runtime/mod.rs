@@ -286,7 +286,7 @@ pub(crate) struct FileRead<LR = RegexSplitter<Box<dyn io::Read + Send>>> {
 }
 
 impl<LR: LineReader> FileRead<LR> {
-    pub(crate) fn try_resize(&self, size: usize) -> Vec<impl FnOnce() -> Option<Self> + Send> {
+    pub(crate) fn try_resize(&mut self, size: usize) -> Vec<impl FnOnce() -> Option<Self> + Send> {
         self.stdin
             .request_handles(size)
             .into_iter()

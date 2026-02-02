@@ -1,13 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
+use hashbrown::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
 use crate::arena::Arena;
-use crate::ast;
+use crate::{ast, builtins};
 use crate::ast::{Binop, Expr, Pattern, Stmt};
+use crate::builtins::Function;
+use crate::common::Either;
 use crate::parallelization::detect_locals::{find_truly_globals, index_into_gl_var};
 use crate::parallelization::find_global::GlobalVar;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum ParallelOp {
     Plus,
     Mult,
@@ -17,7 +20,10 @@ pub enum ParallelOp {
     LastAssigned
 }
 
-pub fn check_parallelizability<'a, 'b, I: Clone + Hash + Eq+Debug>(program: &ast::Prog<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'a, I>>) -> (bool, HashMap<GlobalVar<'a, I>, ParallelOp>) {
+pub fn check_parallelizability<'a, 'b, I: Clone + Hash + Eq+Debug>(program: &ast::Prog<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'a, I>>) -> (bool, HashMap<GlobalVar<'a, I>, ParallelOp>)
+    where Function: TryFrom<I>
+{
+    // println!("Global vars: {:?}", global_vars);
     let mut result: HashMap<GlobalVar<'a, I>, ParallelOp> = HashMap::new();
     
     for (pattern, _) in &program.pats {
@@ -25,6 +31,7 @@ pub fn check_parallelizability<'a, 'b, I: Clone + Hash + Eq+Debug>(program: &ast
     }
 
     let truly_globals = find_truly_globals(program, global_vars);
+    // println!("Truly globals: {:?}", truly_globals);
 
     for (_, maybe_stmt) in &program.pats {
         match maybe_stmt {
@@ -42,7 +49,9 @@ pub fn check_parallelizability<'a, 'b, I: Clone + Hash + Eq+Debug>(program: &ast
     (true, result)
 }
 
-fn check_pattern_parallelizability<'a, I: Clone + Hash + Eq+Debug>(pattern: &Pattern<I>, global_vars: &HashSet<GlobalVar<'a, I>>) -> bool {
+fn check_pattern_parallelizability<'a, I: Clone + Hash + Eq+Debug>(pattern: &Pattern<I>, global_vars: &HashSet<GlobalVar<'a, I>>) -> bool
+    where Function: TryFrom<I>
+{
     match pattern {
         Pattern::Null => true,
         Pattern::Comma(..) => false,
@@ -50,7 +59,9 @@ fn check_pattern_parallelizability<'a, I: Clone + Hash + Eq+Debug>(pattern: &Pat
     }
 }
 
-fn check_expression_for_global_vars<'a, 'b, I: Clone + Hash + Eq+Debug>(expression: &Expr<I>, global_vars: &HashSet<GlobalVar<'b, I>>, not_allowed_assignments: &mut Vec<&'a Expr<'a, 'b, I>>) -> bool {
+fn check_expression_for_global_vars<'a, 'b, I: Clone + Hash + Eq+Debug>(expression: &Expr<I>, global_vars: &HashSet<GlobalVar<'b, I>>, not_allowed_assignments: &mut Vec<&'a Expr<'a, 'b, I>>) -> bool
+    where Function: TryFrom<I>
+{
     match expression {
         Expr::ILit(..) => true,
         Expr::FLit(..) => true,
@@ -92,22 +103,51 @@ fn check_expression_for_global_vars<'a, 'b, I: Clone + Hash + Eq+Debug>(expressi
                 Some(_) => false
             }
         }
-        _ => panic!("Not implemented exception")
 
-        //     Call(Either<I, Function>, &'a [&'a crate::ast::Expr<'a, 'b, I>]),
-        //     Getline {
-        //         into: Option<&'a crate::ast::Expr<'a, 'b, I>>,
-        //         from: Option<&'a crate::ast::Expr<'a, 'b, I>>,
-        //         is_file: bool,
-        //     },
-        //     ReadStdin,
-        //     // Used for comma patterns
-        //     Cond(usize),
+        Expr::Cond(_) => false,
 
+        //check what is this
+        Expr::Getline { .. } => false,
+        Expr::ReadStdin => false,
+
+        Expr::Call(func, args) => {
+            let func = define_builtin(func);
+            match func {
+                Either::Left(_) => false,
+                Either::Right(val) => {
+                    if !check_default_function_parallelizability(&val) {return false}
+                    let mut result = true;
+                    for arg in args.iter() {
+                        result = result && check_expression_for_global_vars(arg, global_vars, not_allowed_assignments);
+                        if !result {return false}
+                    }
+                    result
+                }
+            }
+
+
+        }
     }
 }
 
-fn check_statement_parallelizability<'a, I: Clone + Hash + Eq+Debug>(stmt: &Stmt<'_, 'a, I>, global_vars: &HashSet<GlobalVar<'a, I>>, result: &mut HashMap<GlobalVar<'a, I>, ParallelOp>) -> bool {
+pub fn define_builtin<I:Clone>(func: &Either<I, Function>) -> Either<I, Function>
+    where Function: TryFrom<I>
+{
+    match func {
+        Either::Left(val) => {
+            if let Ok(f) = Function::try_from(val.clone()) {
+                Either::Right(f)
+            } else {
+                Either::Left(val.clone())
+            }
+        }
+        a @ Either::Right(_) => a.clone()
+    }
+}
+
+fn check_statement_parallelizability<'a, I: Clone + Hash + Eq+Debug>(stmt: &Stmt<'_, 'a, I>, global_vars: &HashSet<GlobalVar<'a, I>>, result: &mut HashMap<GlobalVar<'a, I>, ParallelOp>) -> bool
+where Function: TryFrom<I>
+{
     match stmt {
         Stmt::Expr(expr) => check_expression_for_parallelizability(expr, global_vars, result, &mut Vec::new()),
         Stmt::Block(vec) => {
@@ -148,20 +188,37 @@ fn check_statement_parallelizability<'a, I: Clone + Hash + Eq+Debug>(stmt: &Stmt
             check_statement_parallelizability(stmt3, global_vars, result)
         }
         Stmt::Print(expressions, spec) => {  // file spec is not implemented here
-            if let Some(_) = spec {
-                panic!("Not implemented exception in check statement parallelizability: print with file spec");
+            if let Some((expr, _)) = spec {
+                if !check_expression_for_global_vars(expr, global_vars, &mut Vec::new()) {return false}
             }
             for expr in expressions.iter() {
                 if !check_expression_for_global_vars(expr, global_vars, &mut Vec::new()) {return false}
             }
             true
         }
-        _ => panic!("Not implemented exception")
+        Stmt::Printf(expr, variables, spec) => {  // file spec is not implemented here
+            if let Some((e, _)) = spec {
+                if !check_expression_for_global_vars(e, global_vars, &mut Vec::new()) {return false}
+            }
+            if !check_expression_for_global_vars(expr, global_vars, &mut Vec::new()) {return false}
+            for expr in variables.iter() {
+                if !check_expression_for_global_vars(expr, global_vars, &mut Vec::new()) {return false}
+            }
+            true
+        }
+        Stmt::Break | Stmt::Continue => true,
+        Stmt::LastCond(_) | Stmt::EndCond(_) | Stmt::StartCond(_) => false,
+
+        //check these later
+        Stmt::Next | Stmt::NextFile | Stmt::Return(_) => false,
+        // _ => panic!("Not implemented exception")
     }
 }
 
 fn check_expression_for_parallelizability<'a,'b, I: Clone + Hash + Eq+Debug>
-(expr: &Expr<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'b, I>>, result: &mut HashMap<GlobalVar<'b, I>, ParallelOp>, not_allowed_assignments: &mut Vec<&'a Expr<'a, 'b, I>>) -> bool {
+(expr: &Expr<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'b, I>>, result: &mut HashMap<GlobalVar<'b, I>, ParallelOp>, not_allowed_assignments: &mut Vec<&'a Expr<'a, 'b, I>>) -> bool
+where Function: TryFrom<I>
+{
     match expr {
         Expr::ILit(..) => true,
         Expr::FLit(..) => true,
@@ -288,11 +345,52 @@ fn check_expression_for_parallelizability<'a,'b, I: Clone + Hash + Eq+Debug>
                 _ => panic!("Unreachable statement in check_parallelization Inc")
             }
         },
-        _ => panic!("Not implemented exception")
+        Expr::Index(var, ind) => {
+            check_expression_for_parallelizability(var, global_vars, result, not_allowed_assignments) && check_expression_for_global_vars(ind, global_vars, not_allowed_assignments)
+        },
+        Expr::Call(func, args) => {
+            let func = define_builtin(func);
+            match func {
+                Either::Left(val) => {
+                    false  //work on this one
+                }
+                Either::Right(func) => {
+                    for val in args.iter() {
+                        if !check_expression_for_global_vars(val, global_vars, not_allowed_assignments) {return false}
+                    }
+                    check_default_function_parallelizability(&func)
+                }
+            }
+        },
+
+
+        //check this one
+        Expr::Getline {..} | Expr::ReadStdin | Expr::Cond(_) => false
     }
 }
 
-fn check_expression_under_assignment<'a, 'b, I: Clone + Hash + Eq+Debug>(i: &GlobalVar<'b, I>, expr: &Expr<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'b, I>>, result: &mut HashMap<GlobalVar<'b, I>, ParallelOp>, index_expr: Option<&Expr<'a, 'b, I>>, not_allowed_assignments: &mut Vec<&'a Expr<'a, 'b, I>>) -> (bool, Option<ParallelOp>) {
+fn check_default_function_parallelizability(func: &Function) -> bool {
+    match func {
+        Function::Unop(_) | Function::Binop(_) | Function::FloatFunc(_) | Function::IntFunc(_) => true,
+        Function::Setcol | Function::Length | Function::Contains => true,
+        Function::Match | Function::SubstrIndex | Function::Substr => true,
+        Function::ToInt | Function::HexToInt | Function::ToUpper | Function::ToLower | Function::Rand => true,
+
+        Function::Srand | Function::ReseedRng | Function::System => false,
+
+
+        //check these functions further
+        Function::Split | Function::Sub | Function::GSub | Function::GenSub | Function::Delete | Function::Clear => false,
+        Function::EscapeCSV | Function::EscapeTSV | Function::JoinCSV | Function::JoinTSV | Function::JoinCols => false,
+        Function::IncMap | Function::Exit => false,
+
+        _ => false
+    }
+}
+
+fn check_expression_under_assignment<'a, 'b, I: Clone + Hash + Eq+Debug>(i: &GlobalVar<'b, I>, expr: &Expr<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'b, I>>, result: &mut HashMap<GlobalVar<'b, I>, ParallelOp>, index_expr: Option<&Expr<'a, 'b, I>>, not_allowed_assignments: &mut Vec<&'a Expr<'a, 'b, I>>) -> (bool, Option<ParallelOp>)
+where Function: TryFrom<I>
+{
     match expr {
         Expr::ILit(..) | Expr::FLit(..) | Expr::PatLit(..) | Expr::StrLit(..) => {(true, Some(ParallelOp::LastAssigned))}
         Expr::Var(var) => {
@@ -370,11 +468,21 @@ fn check_expression_under_assignment<'a, 'b, I: Clone + Hash + Eq+Debug>(i: &Glo
         a@ Expr::Assign(lhs, _) => check_nested_assignment(i, lhs, a, global_vars, result, index_expr, not_allowed_assignments),
         a @ Expr::AssignOp(lhs, _, _) => check_nested_assignment(i, lhs, a, global_vars, result, index_expr, not_allowed_assignments),
         a @ Expr::Inc{is_inc, is_post, x} => check_nested_assignment(i, x, a, global_vars, result, index_expr, not_allowed_assignments),
-        _ => panic!("Not implemented exception in check_parallelization expression under assignment {:?}", expr)
+        a@ Expr::Call(_, _) => {
+            if !check_expression_for_parallelizability(a, global_vars, result, not_allowed_assignments) {return (false, None)}
+            (true, Some(ParallelOp::LastAssigned))
+        },
+        Expr::ITE {..} => {
+            //TODO: check it in the future //
+            (false, None)
+        }
+        Expr::Getline {..} | Expr::ReadStdin | Expr::Cond(_) => (false, None),
     }
 }
 
-fn check_nested_assignment<'a, 'b, I: Clone + Hash + Eq+Debug>(i: &GlobalVar<'b, I>, lhs:&Expr<I>, expr: &Expr<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'b, I>>, result: &mut HashMap<GlobalVar<'b, I>, ParallelOp>, index_expr: Option<&Expr<'a, 'b, I>>, not_allowed_assignments: &mut Vec<&'a Expr<'a, 'b, I>>) -> (bool, Option<ParallelOp>) {
+fn check_nested_assignment<'a, 'b, I: Clone + Hash + Eq+Debug>(i: &GlobalVar<'b, I>, lhs:&Expr<I>, expr: &Expr<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'b, I>>, result: &mut HashMap<GlobalVar<'b, I>, ParallelOp>, index_expr: Option<&Expr<'a, 'b, I>>, not_allowed_assignments: &mut Vec<&'a Expr<'a, 'b, I>>) -> (bool, Option<ParallelOp>)
+where Function: TryFrom<I>
+{
     if !check_expression_for_parallelizability(expr, global_vars, result, not_allowed_assignments) {return (false, None)}
     match lhs {
         Expr::Var(var) => {
@@ -473,19 +581,19 @@ fn find_com_par_operator<I>(expr: &Expr<I>) -> Option<ParallelOp> {
 mod tests {
     use super::*;
     use crate::ast::{Binop, Expr, Pattern, Stmt, Unop};
-    use std::collections::HashSet;
+    use hashbrown::HashSet;
     use crate::arena::Arena;
 
     #[test]
     fn test_pattern_null() {
-        let pattern: Pattern<'_, '_, String> = Pattern::Null;
+        let pattern: Pattern<'_, '_, &str> = Pattern::Null;
         let globals = HashSet::new();
         assert!(check_pattern_parallelizability(&pattern, &globals));
     }
 
     #[test]
     fn test_pattern_bool_no_globals() {
-        let pattern = Pattern::Bool(&Expr::<String>::ILit(1));
+        let pattern = Pattern::Bool(&Expr::<&str>::ILit(1));
         let globals = HashSet::new();
         assert!(check_pattern_parallelizability(&pattern, &globals));
     }
@@ -507,14 +615,14 @@ mod tests {
 
     #[test]
     fn test_pattern_comma() {
-        let pattern = Pattern::Comma(&Expr::<String>::ILit(1), &Expr::ILit(2));
+        let pattern = Pattern::Comma(&Expr::<&str>::ILit(1), &Expr::ILit(2));
         let globals = HashSet::new();
         assert!(!check_pattern_parallelizability(&pattern, &globals));
     }
 
     #[test]
     fn test_expression_global_vars_literals() {
-        let expr = Expr::<String>::ILit(42);
+        let expr = Expr::<&str>::ILit(42);
         let globals = HashSet::new();
         assert!(check_expression_for_global_vars(&expr, &globals, &mut Vec::new()));
     }
@@ -558,7 +666,7 @@ mod tests {
 
     #[test]
     fn test_statement_expr_no_globals() {
-        let stmt = Stmt::Expr(&Expr::<String>::ILit(1));
+        let stmt = Stmt::Expr(&Expr::<&str>::ILit(1));
         let globals = HashSet::new();
         let mut result = HashMap::new();
         assert!(check_statement_parallelizability(&stmt, &globals, &mut result));
@@ -577,7 +685,7 @@ mod tests {
     fn test_statement_block_empty() {
         let arena = Arena::default();
         let vec = Arena::new_vec_from_slice(&arena, &[]);
-        let stmt: Stmt<'_, '_, String> = Stmt::Block(vec);
+        let stmt: Stmt<'_, '_, &str> = Stmt::Block(vec);
         let globals = HashSet::new();
         let mut result = HashMap::new();
         assert!(check_statement_parallelizability(&stmt, &globals, &mut result));
@@ -587,7 +695,7 @@ mod tests {
     fn test_statement_block_with_statements() {
         let arena = Arena::default();
         let vec = Arena::new_vec_from_slice(&arena, &[
-            &Stmt::Expr(&Expr::<String>::ILit(1)),
+            &Stmt::Expr(&Expr::<&str>::ILit(1)),
             &Stmt::Expr(&Expr::ILit(2))
         ]);
         let stmt = Stmt::Block(vec);
@@ -598,7 +706,7 @@ mod tests {
 
     #[test]
     fn test_statement_if_no_else() {
-        let stmt = Stmt::If(&Expr::<String>::ILit(1), &Stmt::Expr(&Expr::ILit(2)), None);
+        let stmt = Stmt::If(&Expr::<&str>::ILit(1), &Stmt::Expr(&Expr::ILit(2)), None);
         let globals = HashSet::new();
         let mut result = HashMap::new();
         assert!(check_statement_parallelizability(&stmt, &globals, &mut result));
@@ -606,7 +714,7 @@ mod tests {
 
     #[test]
     fn test_statement_if_with_else() {
-        let stmt = Stmt::If(&Expr::<String>::ILit(1), &Stmt::Expr(&Expr::ILit(2)), Some(&Stmt::Expr(&Expr::ILit(3))));
+        let stmt = Stmt::If(&Expr::<&str>::ILit(1), &Stmt::Expr(&Expr::ILit(2)), Some(&Stmt::Expr(&Expr::ILit(3))));
         let globals = HashSet::new();
         let mut result = HashMap::new();
         assert!(check_statement_parallelizability(&stmt, &globals, &mut result));
@@ -623,7 +731,7 @@ mod tests {
 
     #[test]
     fn test_statement_print_no_globals() {
-        let stmt = Stmt::Print(&[&Expr::<String>::ILit(1), &Expr::ILit(2)], None);
+        let stmt = Stmt::Print(&[&Expr::<&str>::ILit(1), &Expr::ILit(2)], None);
         let globals = HashSet::new();
         let mut result = HashMap::new();
         assert!(check_statement_parallelizability(&stmt, &globals, &mut result));
@@ -640,7 +748,7 @@ mod tests {
 
     #[test]
     fn test_expression_parallelizability_literal() {
-        let expr: ast::Expr<'_, '_, String> = Expr::ILit(42);
+        let expr: ast::Expr<'_, '_, &str> = Expr::ILit(42);
         let globals = HashSet::new();
         let mut result = HashMap::new();
         assert!(check_expression_for_parallelizability(&expr, &globals, &mut result, &mut Vec::new()));
