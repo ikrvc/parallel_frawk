@@ -5,10 +5,10 @@ use std::hash::Hash;
 use crate::arena::Arena;
 use crate::{ast, builtins};
 use crate::ast::{Binop, Expr, Pattern, Stmt};
-use crate::builtins::Function;
+use crate::builtins::{Function, IsSprintf};
 use crate::common::Either;
 use crate::parallelization::detect_locals::{find_truly_globals, index_into_gl_var};
-use crate::parallelization::find_global::GlobalVar;
+use crate::parallelization::find_global::{ArrayUnknown, GlobalVar};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum ParallelOp {
@@ -20,7 +20,7 @@ pub enum ParallelOp {
     LastAssigned
 }
 
-pub fn check_parallelizability<'a, 'b, I: Clone + Hash + Eq+Debug>(program: &ast::Prog<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'a, I>>) -> (bool, HashMap<GlobalVar<'a, I>, ParallelOp>)
+pub fn check_parallelizability<'a, 'b, I: IsSprintf+Clone + Hash + Eq+Debug>(program: &ast::Prog<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'a, I>>) -> (bool, HashMap<GlobalVar<'a, I>, ParallelOp>)
     where Function: TryFrom<I>
 {
     // println!("Global vars: {:?}", global_vars);
@@ -46,10 +46,11 @@ pub fn check_parallelizability<'a, 'b, I: Clone + Hash + Eq+Debug>(program: &ast
             result.insert(var.clone(), ParallelOp::LastAssigned);
         }
     }
+    // println!("Result: {:?}", result);
     (true, result)
 }
 
-fn check_pattern_parallelizability<'a, I: Clone + Hash + Eq+Debug>(pattern: &Pattern<I>, global_vars: &HashSet<GlobalVar<'a, I>>) -> bool
+fn check_pattern_parallelizability<'a, I: IsSprintf+ Clone + Hash + Eq+Debug>(pattern: &Pattern<I>, global_vars: &HashSet<GlobalVar<'a, I>>) -> bool
     where Function: TryFrom<I>
 {
     match pattern {
@@ -59,7 +60,7 @@ fn check_pattern_parallelizability<'a, I: Clone + Hash + Eq+Debug>(pattern: &Pat
     }
 }
 
-fn check_expression_for_global_vars<'a, 'b, I: Clone + Hash + Eq+Debug>(expression: &Expr<I>, global_vars: &HashSet<GlobalVar<'b, I>>, not_allowed_assignments: &mut Vec<&'a Expr<'a, 'b, I>>) -> bool
+fn check_expression_for_global_vars<'a, 'b, I: IsSprintf+Clone + Hash + Eq+Debug>(expression: &Expr<I>, global_vars: &HashSet<GlobalVar<'b, I>>, not_allowed_assignments: &mut Vec<&'a Expr<'a, 'b, I>>) -> bool
     where Function: TryFrom<I>
 {
     match expression {
@@ -113,9 +114,18 @@ fn check_expression_for_global_vars<'a, 'b, I: Clone + Hash + Eq+Debug>(expressi
         Expr::Call(func, args) => {
             let func = define_builtin(func);
             match func {
-                Either::Left(_) => false,
+                Either::Left(f) => {
+                    if f.is_sprintf() {
+                        let mut result = true;
+                        for arg in args.iter() {
+                            result = result && check_expression_for_global_vars(arg, global_vars, not_allowed_assignments);
+                            if !result {return false}
+                        }
+                        result
+                    } else { false }
+                },
                 Either::Right(val) => {
-                    if !check_default_function_parallelizability(&val) {return false}
+                    if !check_default_function_parallelizability(&val, args, global_vars) {return false}
                     let mut result = true;
                     for arg in args.iter() {
                         result = result && check_expression_for_global_vars(arg, global_vars, not_allowed_assignments);
@@ -145,7 +155,7 @@ pub fn define_builtin<I:Clone>(func: &Either<I, Function>) -> Either<I, Function
     }
 }
 
-fn check_statement_parallelizability<'a, I: Clone + Hash + Eq+Debug>(stmt: &Stmt<'_, 'a, I>, global_vars: &HashSet<GlobalVar<'a, I>>, result: &mut HashMap<GlobalVar<'a, I>, ParallelOp>) -> bool
+fn check_statement_parallelizability<'a, I: IsSprintf+Clone + Hash + Eq+Debug>(stmt: &Stmt<'_, 'a, I>, global_vars: &HashSet<GlobalVar<'a, I>>, result: &mut HashMap<GlobalVar<'a, I>, ParallelOp>) -> bool
 where Function: TryFrom<I>
 {
     match stmt {
@@ -166,7 +176,20 @@ where Function: TryFrom<I>
         }
         Stmt::While(_, cond, stmt)
         | Stmt::ForEach(_, cond, stmt) => {
-            if !check_expression_for_global_vars(cond, global_vars, &mut Vec::new()) {return false}
+            match cond {
+                Expr::Var(i) => { //special case when variable is actually an array
+                    for var in global_vars {
+                        match var {
+                            a@ GlobalVar::Scalar(i_global)
+                            | a @ GlobalVar::ArrayExact(i_global, _)
+                            | a @ GlobalVar::ArrayUnknown(ArrayUnknown {id:i_global, fully_redefined:_})=> {
+                                if i == i_global {return false}
+                            }
+                        }
+                    }
+                }
+                _ => {if !check_expression_for_global_vars(cond, global_vars, &mut Vec::new()) {return false}}
+            }
             if !check_statement_parallelizability(stmt, global_vars, result) {return false}
             true
         },
@@ -215,7 +238,7 @@ where Function: TryFrom<I>
     }
 }
 
-fn check_expression_for_parallelizability<'a,'b, I: Clone + Hash + Eq+Debug>
+fn check_expression_for_parallelizability<'a,'b, I: IsSprintf + Clone + Hash + Eq+Debug>
 (expr: &Expr<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'b, I>>, result: &mut HashMap<GlobalVar<'b, I>, ParallelOp>, not_allowed_assignments: &mut Vec<&'a Expr<'a, 'b, I>>) -> bool
 where Function: TryFrom<I>
 {
@@ -352,13 +375,19 @@ where Function: TryFrom<I>
             let func = define_builtin(func);
             match func {
                 Either::Left(val) => {
+                    for val in args.iter() {
+                        if !check_expression_for_global_vars(val, global_vars, not_allowed_assignments) {return false}
+                    }
+                    // panic!("Failed because of custom user function");
                     false  //work on this one
                 }
                 Either::Right(func) => {
                     for val in args.iter() {
                         if !check_expression_for_global_vars(val, global_vars, not_allowed_assignments) {return false}
                     }
-                    check_default_function_parallelizability(&func)
+                    let result = check_default_function_parallelizability(&func, args, global_vars);
+                    // if(!result) {panic!("Failed because of function: {:?}", func);}
+                    result
                 }
             }
         },
@@ -369,7 +398,7 @@ where Function: TryFrom<I>
     }
 }
 
-fn check_default_function_parallelizability(func: &Function) -> bool {
+fn check_default_function_parallelizability<I: Clone + Hash + Eq+Debug>(func: &Function, args: &[&Expr<I>], global_vars: &HashSet<GlobalVar<I>>) -> bool {
     match func {
         Function::Unop(_) | Function::Binop(_) | Function::FloatFunc(_) | Function::IntFunc(_) => true,
         Function::Setcol | Function::Length | Function::Contains => true,
@@ -380,15 +409,32 @@ fn check_default_function_parallelizability(func: &Function) -> bool {
 
 
         //check these functions further
-        Function::Split | Function::Sub | Function::GSub | Function::GenSub | Function::Delete | Function::Clear => false,
+        Function::GenSub | Function::Delete | Function::Clear => false,
         Function::EscapeCSV | Function::EscapeTSV | Function::JoinCSV | Function::JoinTSV | Function::JoinCols => false,
         Function::IncMap | Function::Exit => false,
 
-        _ => false
+        Function::Split => {
+            if let Some(id) = args.get(1) {
+                match id {
+                    Expr::Var(v) => if global_vars.contains(&GlobalVar::ArrayUnknown(ArrayUnknown {id:v.clone(), fully_redefined:false})) {return false}
+                    _ => panic!("Split is used with incorrect argument type")
+                }
+            }
+            if let Some(id) = args.get(3) {
+                match id {
+                    Expr::Var(v) => if global_vars.contains(&GlobalVar::ArrayUnknown(ArrayUnknown {id:v.clone(), fully_redefined:false})) {return false}
+                    _ => panic!("Split is used with incorrect argument type")
+                }
+            }
+            true
+        }
+        Function::Sub | Function::GSub => true,
+
+            _ => false
     }
 }
 
-fn check_expression_under_assignment<'a, 'b, I: Clone + Hash + Eq+Debug>(i: &GlobalVar<'b, I>, expr: &Expr<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'b, I>>, result: &mut HashMap<GlobalVar<'b, I>, ParallelOp>, index_expr: Option<&Expr<'a, 'b, I>>, not_allowed_assignments: &mut Vec<&'a Expr<'a, 'b, I>>) -> (bool, Option<ParallelOp>)
+fn check_expression_under_assignment<'a, 'b, I: IsSprintf + Clone + Hash + Eq+Debug>(i: &GlobalVar<'b, I>, expr: &Expr<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'b, I>>, result: &mut HashMap<GlobalVar<'b, I>, ParallelOp>, index_expr: Option<&Expr<'a, 'b, I>>, not_allowed_assignments: &mut Vec<&'a Expr<'a, 'b, I>>) -> (bool, Option<ParallelOp>)
 where Function: TryFrom<I>
 {
     match expr {
@@ -404,12 +450,15 @@ where Function: TryFrom<I>
             let gl_var = index_into_gl_var(var, ind, global_vars);
             match gl_var {
                 None => (true, Some(ParallelOp::LastAssigned)),
-                Some(a @ GlobalVar::ArrayUnknown(_)) => {
-                    if a == *i && index_expr.unwrap() == *ind {
-                        (true, None)
-                    } else {
-                        (false, None)
+                Some(GlobalVar::ArrayUnknown(val)) => {
+                    if let GlobalVar::ArrayUnknown(i_val) = i {
+                        if val.id == i_val.id && index_expr.unwrap() == *ind {
+                            return (true, None)
+                        }
                     }
+                    if global_vars.contains(&GlobalVar::ArrayUnknown(ArrayUnknown {id: val.id.clone(), fully_redefined: false})) {return (false, None)}
+                    if global_vars.contains(&GlobalVar::ArrayUnknown(ArrayUnknown {id: val.id.clone(), fully_redefined: true})) {return (false, None)}
+                    (true, None)
                 }, //adjust later
                 Some(var) => {
                     if var == *i {return (true, None);}
@@ -480,7 +529,7 @@ where Function: TryFrom<I>
     }
 }
 
-fn check_nested_assignment<'a, 'b, I: Clone + Hash + Eq+Debug>(i: &GlobalVar<'b, I>, lhs:&Expr<I>, expr: &Expr<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'b, I>>, result: &mut HashMap<GlobalVar<'b, I>, ParallelOp>, index_expr: Option<&Expr<'a, 'b, I>>, not_allowed_assignments: &mut Vec<&'a Expr<'a, 'b, I>>) -> (bool, Option<ParallelOp>)
+fn check_nested_assignment<'a, 'b, I: IsSprintf + Clone + Hash + Eq+Debug>(i: &GlobalVar<'b, I>, lhs:&Expr<I>, expr: &Expr<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'b, I>>, result: &mut HashMap<GlobalVar<'b, I>, ParallelOp>, index_expr: Option<&Expr<'a, 'b, I>>, not_allowed_assignments: &mut Vec<&'a Expr<'a, 'b, I>>) -> (bool, Option<ParallelOp>)
 where Function: TryFrom<I>
 {
     if !check_expression_for_parallelizability(expr, global_vars, result, not_allowed_assignments) {return (false, None)}
@@ -501,12 +550,15 @@ where Function: TryFrom<I>
             let gl_var = index_into_gl_var(var, ind, global_vars);
             match gl_var {
                 None => (true, Some(ParallelOp::LastAssigned)),
-                Some(a @ GlobalVar::ArrayUnknown(_)) => {
-                    if a == *i && index_expr.unwrap() == *ind {
-                        (true, None)
-                    } else {
-                        (false, None)
+                Some(GlobalVar::ArrayUnknown(val)) => {
+                    if let GlobalVar::ArrayUnknown(i_val) = i {
+                        if val.id == i_val.id && index_expr.unwrap() == *ind {
+                            return (true, None)
+                        }
                     }
+                    if global_vars.contains(&GlobalVar::ArrayUnknown(ArrayUnknown {id: val.id.clone(), fully_redefined: false})) {return (false, None)}
+                    if global_vars.contains(&GlobalVar::ArrayUnknown(ArrayUnknown {id: val.id.clone(), fully_redefined: true})) {return (false, None)}
+                    (true, None)
                 },
                 Some(var) => {
                     if var == *i {return (true, None);}

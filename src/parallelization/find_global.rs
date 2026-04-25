@@ -13,7 +13,13 @@ use crate::parallelization::ast_check_parallelization::define_builtin;
 pub enum GlobalVar<'a, I: Clone + Hash + Eq + Debug> {
     Scalar(I),
     ArrayExact(I, IndexVal<'a>),   // array with index known statically
-    ArrayUnknown(I),               // array accessed with a dynamic index
+    ArrayUnknown(ArrayUnknown<I>),               // array accessed with a dynamic index
+}
+
+#[derive(Clone, Hash, Eq, PartialEq, Debug)]
+pub struct ArrayUnknown<I: Clone + Hash + Eq + Debug> {
+    pub id: I,
+    pub fully_redefined: bool,
 }
 
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
@@ -68,7 +74,7 @@ where
                 if arr_type_sim(&val, array_type.get(&i).unwrap()) {
                     GlobalVar::ArrayExact(i, val)
                 } else {
-                    GlobalVar::ArrayUnknown(i)
+                    GlobalVar::ArrayUnknown(ArrayUnknown { id:i, fully_redefined: false })
                 }
             }
         }
@@ -226,6 +232,9 @@ fn has_assigns_in_expr<'a, I: Clone + Hash + Eq + Debug>(expr: &Expr<'_, 'a, I>,
             if let Expr::Var(v) = x {
                 res.1.insert(GlobalVar::Scalar(v.clone()));
                 res
+            } else if let Expr::Index(v, ind) = x {
+                process_index(v, ind, &mut res.1, array_type);
+                res
             } else {
                 res
             }
@@ -280,6 +289,9 @@ fn has_assigns_in_expr<'a, I: Clone + Hash + Eq + Debug>(expr: &Expr<'_, 'a, I>,
                         Function::Split => {
                             extract_split_args(&mut res, args);
                         }
+                        Function::Sub | Function::GSub => {
+                            extract_sub_args(&mut res, args, array_type);
+                        }
                         _ => {}
                     }
                 }
@@ -297,15 +309,27 @@ fn has_assigns_in_expr<'a, I: Clone + Hash + Eq + Debug>(expr: &Expr<'_, 'a, I>,
 fn extract_split_args<'a, I: Clone + Hash + Eq + Debug>(res: &mut (bool, HashSet<GlobalVar<'a, I>>), args: &[&Expr<I>]) {
     if res.0 == false {return}
 
-    match args.get(1).unwrap_or_else(|| panic!("Split is used with less than one argument")) {
-        Expr::Var(i) => {res.1.insert(GlobalVar::ArrayUnknown(i.clone()));}
+    match args.get(1).unwrap_or_else(|| panic!("Split is used with less than two argument")) {
+        Expr::Var(i) => {res.1.insert(GlobalVar::ArrayUnknown(ArrayUnknown { id:i.clone(), fully_redefined: false }));}
         _ => panic!("Split is used with incorrect argument type")
     }
 
     if let Some(val) = args.get(3) {
         match val {
-            Expr::Var(i) => { res.1.insert(GlobalVar::ArrayUnknown(i.clone())); }
+            Expr::Var(i) => { res.1.insert(GlobalVar::ArrayUnknown(ArrayUnknown { id:i.clone(), fully_redefined: false })); }
             _ => panic!("Split is used with incorrect argument type")
+        }
+    }
+}
+
+fn extract_sub_args<'a, I: Clone + Hash + Eq + Debug>(res: &mut (bool, HashSet<GlobalVar<'a, I>>), args: &[&Expr<'_, 'a, I>], array_type: &mut HashMap<I, ArrType>) {
+    if res.0 == false {return}
+
+    if let Some(val) = args.get(2) {
+        match val {
+            Expr::Var(i) => { res.1.insert(GlobalVar::Scalar(i.clone())); }
+            Expr::Index(v, ind) => {process_index(v, ind, &mut res.1, array_type);}
+            _ => {return}
         }
     }
 }
@@ -316,28 +340,28 @@ fn process_index<'a, I: Clone + Hash + Eq + Debug>(name: &Expr<I>, index: &Expr<
             match index {
                 Expr::ILit(i) => {
                     if !check_arr_type(v, array_type, ArrType::Int) {
-                        res.insert(GlobalVar::ArrayUnknown(v.clone()));
+                        res.insert(GlobalVar::ArrayUnknown(ArrayUnknown { id:v.clone(), fully_redefined: false }));
                         return
                     }
                     res.insert(GlobalVar::ArrayExact(v.clone(), IndexVal::IntLit(i.clone())));
                 },
                 Expr::StrLit(i) => {
                     if !check_arr_type(v, array_type, ArrType::Str) {
-                        res.insert(GlobalVar::ArrayUnknown(v.clone()));
+                        res.insert(GlobalVar::ArrayUnknown(ArrayUnknown { id:v.clone(), fully_redefined: false }));
                         return
                     }
                     res.insert(GlobalVar::ArrayExact(v.clone(), IndexVal::StrLit(i.clone())));
                 },
                 Expr::PatLit(i) => {
                     if !check_arr_type(v, array_type, ArrType::Pat) {
-                        res.insert(GlobalVar::ArrayUnknown(v.clone()));
+                        res.insert(GlobalVar::ArrayUnknown(ArrayUnknown { id:v.clone(), fully_redefined: false }));
                         return
                     }
                     res.insert(GlobalVar::ArrayExact(v.clone(), IndexVal::PatLit(i.clone())));
                 },
                 _ => {
                     array_type.insert(v.clone(), ArrType::Unknown);
-                    res.insert(GlobalVar::ArrayUnknown(v.clone()));
+                    res.insert(GlobalVar::ArrayUnknown(ArrayUnknown { id:v.clone(), fully_redefined: false }));
                 }
             }
         }
@@ -473,7 +497,7 @@ mod tests {
 
         let globals = has_assigns_in_stmt(&stmt, &mut HashMap::new());
 
-        let expected = (true, [GlobalVar::ArrayUnknown("arr")].into());
+        let expected = (true, [GlobalVar::ArrayUnknown(ArrayUnknown { id:"arr", fully_redefined: false })].into());
         assert_eq!(globals, expected);
     }
 
@@ -527,7 +551,7 @@ mod tests {
 
         let globals = has_assigns_in_stmt(&stmt, &mut HashMap::new());
 
-        let expected = (true, [GlobalVar::ArrayUnknown("arr")].into());
+        let expected = (true, [GlobalVar::ArrayUnknown(ArrayUnknown { id:"arr", fully_redefined: false })].into());
         assert_eq!(globals, expected);
     }
 
@@ -586,7 +610,7 @@ mod tests {
         let globals = find_global(&prog);
 
         // Second assignment forces downgrade to ArrayUnknown
-        let expected = [GlobalVar::ArrayUnknown("arr")].into();
+        let expected = [GlobalVar::ArrayUnknown(ArrayUnknown { id:"arr", fully_redefined: false })].into();
         assert_eq!(globals, (true, expected));
     }
 
@@ -627,7 +651,7 @@ mod tests {
 
         let globals = find_global(&prog);
 
-        let expected = [GlobalVar::ArrayUnknown("m")].into();
+        let expected = [GlobalVar::ArrayUnknown(ArrayUnknown { id:"m", fully_redefined: false })].into();
         assert_eq!(globals, (true, expected));
     }
 

@@ -2,12 +2,13 @@ use std::convert::TryFrom;
 use hashbrown::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
+use itertools::enumerate;
 use crate::ast;
 use crate::ast::{Expr, Stmt};
 use crate::builtins::Function;
 use crate::common::Either;
 use crate::parallelization::ast_check_parallelization::{define_builtin, valid_lhs};
-use crate::parallelization::find_global::{GlobalVar, IndexVal};
+use crate::parallelization::find_global::{ArrayUnknown, GlobalVar, IndexVal};
 
 pub fn find_truly_globals<'a, 'b, I: Clone + Hash + Eq+Debug>(program: &ast::Prog<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'a, I>>) -> HashSet<GlobalVar<'a, I>>
 where Function: TryFrom<I>
@@ -94,7 +95,24 @@ where Function: TryFrom<I>
             dependency_stack.pop();
         },
         Stmt::ForEach(_, expr, stmt) => {
-            check_expression_for_locality(expr, global_vars, usages, truly_globals, dependency_stack);
+            match expr {
+                Expr::Var(i) => { //special case when variable is actually an array
+                    for var in global_vars {
+                        match var {
+                            a@ GlobalVar::Scalar(i_global)
+                            | a @ GlobalVar::ArrayExact(i_global, _) => {
+                                if i == i_global {check_if_assigned(a, truly_globals, dependency_stack);}
+                            }
+                            a@ GlobalVar::ArrayUnknown(ArrayUnknown {id:i_global, fully_redefined:_}) => {
+                                if i == i_global && !check_if_in_dependency_stack(&GlobalVar::ArrayUnknown(ArrayUnknown {id: i.clone(), fully_redefined: true}), truly_globals, dependency_stack) {
+                                    truly_globals.insert(a.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {check_expression_for_locality(expr, global_vars, usages, truly_globals, dependency_stack);}
+            }
             dependency_stack.push(HashMap::new()); //add new branch scope
             check_statement_for_locality(stmt, global_vars, usages, truly_globals, dependency_stack);
             dependency_stack.pop();
@@ -153,9 +171,11 @@ where Function: TryFrom<I>,
             let gl_var = index_into_gl_var(var, ind, global_vars);
             match gl_var {
                 None => HashSet::new(),
-                Some(a@ GlobalVar::ArrayUnknown(_)) => {
-                    truly_globals.insert(a.clone());
-                    HashSet::from([a])
+                Some(GlobalVar::ArrayUnknown(val)) => {
+                    if !check_if_in_dependency_stack(&GlobalVar::ArrayUnknown(ArrayUnknown {id: val.id.clone(), fully_redefined: true}), truly_globals, dependency_stack) {
+                        truly_globals.insert(GlobalVar::ArrayUnknown(val.clone()));
+                    }
+                    HashSet::from([GlobalVar::ArrayUnknown(val)])
                 }
                 Some(arr_ind) => {
                     check_if_assigned(&arr_ind, truly_globals, dependency_stack);
@@ -304,11 +324,24 @@ where Function: TryFrom<I>,
             match func {
                 Either::Left(_) => {}
                 Either::Right(func) => {
-                    // match func {
-                    //     Function::Split => {
-                    //
-                    //     }
-                    // }
+                    match func {
+                        Function::Split => {
+                            res.extend(check_expression_for_locality(args.get(0).unwrap_or_else(|| panic!("Split is used with less than one argument")), global_vars, usages, truly_globals, dependency_stack));
+                            extract_split_args(args, &mut res, global_vars, usages, truly_globals, dependency_stack);
+                            return res;
+                        }
+                        Function::Sub | Function::GSub => {
+                            for arg in enumerate(args.iter()) {
+                                if arg.0 <= 2 {
+                                    res.extend(check_expression_for_locality(arg.1, global_vars, usages, truly_globals, dependency_stack));
+                                } else if arg.0 == 2 {
+                                    extract_sub_arg(arg.1, &mut res, global_vars, usages, truly_globals, dependency_stack);
+                                    return res;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             for arg in args.iter() {
@@ -317,6 +350,66 @@ where Function: TryFrom<I>,
             res
         }
         // _ => panic!("Not implemented exception")
+    }
+}
+
+fn extract_sub_arg<'a, I: Clone + Hash + Eq + Debug>(arg: &Expr<'_, 'a, I>, expr_dependencies: &mut HashSet<GlobalVar<'a, I>>, global_vars: &HashSet<GlobalVar<'a, I>>, usages: &mut HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>, truly_globals: &mut HashSet<GlobalVar<'a, I>>, dependency_stack: &mut Vec<HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>>)
+where Function: TryFrom<I>,
+{
+    match arg {
+        Expr::Var(var) => {
+            let gl_var = GlobalVar::Scalar(var.clone());
+            if !global_vars.contains(&gl_var) {return }
+            else {
+                expr_dependencies.insert(gl_var.clone());
+                add_dependency(&gl_var, &expr_dependencies, usages, truly_globals, dependency_stack);
+                expr_dependencies.insert(gl_var);
+            }
+        }
+        a @ Expr::Index(var, ind) => {
+            let gl_var =   index_into_gl_var(var, ind, global_vars);
+            match gl_var {
+                None => return,
+                Some(GlobalVar::ArrayUnknown(_)) => {
+                    expr_dependencies.extend(check_expression_for_locality(a, global_vars, usages, truly_globals, dependency_stack));
+                }
+                Some(val) => {
+                    expr_dependencies.insert(val.clone());
+                    add_dependency(&val, &expr_dependencies, usages, truly_globals, dependency_stack);
+                }
+            }
+        },
+        _ => { expr_dependencies.extend(check_expression_for_locality(arg, global_vars, usages, truly_globals, dependency_stack));}
+    }
+}
+
+fn extract_split_args<'a, I: Clone + Hash + Eq + Debug>(args: &[&Expr<'_, 'a, I>], expr_dependencies: &mut HashSet<GlobalVar<'a, I>>, global_vars: &HashSet<GlobalVar<'a, I>>, usages: &mut HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>, truly_globals: &mut HashSet<GlobalVar<'a, I>>, dependency_stack: &mut Vec<HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>>)
+where Function: TryFrom<I>,
+{
+    match args.get(1).unwrap_or_else(|| panic!("Split is used with less than two argument")) {
+        Expr::Var(i) => { add_redefined_array_dependencies(i, expr_dependencies, usages, truly_globals, dependency_stack); }
+        _ => panic!("Split is used with incorrect argument type")
+    }
+
+    if let Some(val) = args.get(2) {
+        expr_dependencies.extend(check_expression_for_locality(val, global_vars, usages, truly_globals, dependency_stack));
+
+    }
+
+    if let Some(val) = args.get(3) {
+        match val {
+            Expr::Var(i) => { add_redefined_array_dependencies(i, expr_dependencies, usages, truly_globals, dependency_stack); }
+            _ => panic!("Split is used with incorrect argument type")
+        }
+    }
+}
+
+fn add_redefined_array_dependencies<'a, I: Clone + Hash + Eq + Debug>(i: &I, expr_dependencies: &HashSet<GlobalVar<'a, I>>, usages: &mut HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>, truly_globals: &mut HashSet<GlobalVar<'a, I>>, dependency_stack: &mut Vec<HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>>) {
+    let val = GlobalVar::ArrayUnknown(ArrayUnknown {id: i.clone(), fully_redefined: false});
+    modify_usages(expr_dependencies, &val, usages);
+    if truly_globals.contains(&val) {}
+    else {
+        dependency_stack.last_mut().unwrap().insert(GlobalVar::ArrayUnknown(ArrayUnknown {id: i.clone(), fully_redefined: true}), HashSet::new());
     }
 }
 
@@ -345,6 +438,16 @@ fn add_dependency<'a, I: Clone + Hash + Eq+Debug>(var: &GlobalVar<'a, I>, expr_d
         }
     }
     truly_globals.insert(var.clone()); //new assignment based on previous value
+}
+
+fn check_if_in_dependency_stack<'a, I: Clone + Hash + Eq+Debug>(var: &GlobalVar<'a, I>, truly_globals: &mut HashSet<GlobalVar<'a, I>>, dependency_stack: &mut Vec<HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>>) -> bool {
+    if truly_globals.contains(var) {return false}
+    for l in dependency_stack.iter().rev() { //find assignment based on previously assigned value
+        if l.contains_key(var) {
+            return true
+        }
+    }
+    false
 }
 
 fn modify_usages<'a, I: Clone + Hash + Eq+Debug>(dependencies: &HashSet<GlobalVar<'a, I>>, var: &GlobalVar<'a, I>, usages: &mut HashMap<GlobalVar<'a, I>, HashSet<GlobalVar<'a, I>>>) {
@@ -377,8 +480,8 @@ fn connect_environments<'a, I: Clone + Hash + Eq+Debug>(env1: HashMap<GlobalVar<
 pub fn index_into_gl_var<'a, I: Clone + Hash + Eq+Debug>(var: &Expr<I>, ind: &Expr<'_, 'a, I>, global_var: &HashSet<GlobalVar<'a, I>>) -> Option<GlobalVar<'a, I>> {
     match var {
         Expr::Var(val) => {
-            let unknown = GlobalVar::ArrayUnknown(val.clone());
-            if global_var.contains(&unknown) {return Some(unknown);}
+            let unknown_add = GlobalVar::ArrayUnknown(ArrayUnknown { id:val.clone(), fully_redefined: false });
+            if global_var.contains(&unknown_add) {return Some(unknown_add);}
             match ind {
                 Expr::ILit(i) => {
                     let gl_var = GlobalVar::ArrayExact(val.clone(), IndexVal::IntLit(i.clone()));

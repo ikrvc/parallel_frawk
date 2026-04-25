@@ -299,6 +299,7 @@ fn get_context<'a>(
     prog: &str,
     a: &'a Arena,
     mut prelude: Prelude<'a>,
+    execution_strategy: ExecutionStrategy
 ) -> cfg::ProgramContext<'a, &'a str> {
     let prog = a.alloc_str(prog);
     let lexer = lexer::Tokenizer::new(prog);
@@ -319,7 +320,7 @@ fn get_context<'a>(
             fail!("{}", e);
         }
     };
-    match cfg::ProgramContext::from_prog(a, stmt, prelude.scalars.escaper) {
+    match cfg::ProgramContext::from_prog(a, stmt, prelude.scalars.escaper, execution_strategy) {
         Ok(mut ctx) => {
             ctx.allow_arbitrary_commands = prelude.scalars.arbitrary_shell;
             ctx.fold_regex_constants = prelude.scalars.fold_regexes;
@@ -378,7 +379,7 @@ cfg_if::cfg_if! {
 
         fn dump_llvm(prog: &str, cfg: codegen::Config, raw: &RawPrelude) -> String {
             let a = Arena::default();
-            let mut ctx = get_context(prog, &a, get_prelude(&a, raw));
+            let mut ctx = get_context(prog, &a, get_prelude(&a, raw), ExecutionStrategy::Serial);
             match compile::dump_llvm(&mut ctx, cfg) {
                 Ok(s) => s,
                 Err(e) => fail!("error compiling llvm: {}", e),
@@ -393,7 +394,7 @@ const DEFAULT_OPT_LEVEL: i32 = 3;
 fn dump_bytecode(prog: &str, raw: &RawPrelude) -> String {
     use std::io::Cursor;
     let a = Arena::default();
-    let mut ctx = get_context(prog, &a, get_prelude(&a, raw));
+    let mut ctx = get_context(prog, &a, get_prelude(&a, raw), ExecutionStrategy::Serial);
     let fake_inp: Box<dyn io::Read + Send> = Box::new(Cursor::new(vec![]));
     let interp = match compile::bytecode(
         &mut ctx,
@@ -671,7 +672,8 @@ fn main() {
     }
     if opt_dump_cfg {
         let a = Arena::default();
-        let ctx = get_context(program_string.as_str(), &a, get_prelude(&a, &raw));
+        let ctx = get_context(program_string.as_str(), &a, get_prelude(&a, &raw),
+                              ExecutionStrategy::Serial);
         let mut stdout = std::io::stdout();
         let _ = ctx.dbg_print(&mut stdout);
     }
@@ -874,7 +876,7 @@ fn main() {
     }
 
     let a = Arena::default();
-    let ctx = get_context(program_string.as_str(), &a, get_prelude(&a, &raw));
+    let ctx = get_context(program_string.as_str(), &a, get_prelude(&a, &raw), exec_strategy);
 
     let opt_check_parallel = matches.is_present("check-parallel");
     if opt_check_parallel {

@@ -1,7 +1,7 @@
 use crate::arena;
 use crate::ast::{self, Expr, Stmt, Unop};
 use crate::builtins::{self, IsSprintf};
-use crate::common::{Either, FileSpec, Graph, NodeIx, NumTy, Result, Stage};
+use crate::common::{Either, ExecutionStrategy, FileSpec, Graph, NodeIx, NumTy, Result, Stage};
 use crate::dom;
 use crate::parallelization::find_global;
 
@@ -441,6 +441,7 @@ where
         arena: &'a arena::Arena,
         p: &ast::Prog<'a, 'b, I>,
         esc: Escaper,
+        execution_strategy: ExecutionStrategy
     ) -> Result<Self> {
         // TODO this function is a bit of a slog. It would be nice to break it up.
         let mut shared: GlobalContext<I> = GlobalContext {
@@ -510,15 +511,20 @@ where
         // }
 
         //
-
-        let mut vars_with_assign = find_global::find_global(&p);
-        // println!("Variables changed in the main loop: {:#?}", vars_with_assign);
-        let parallelization;
-        if !vars_with_assign.0 {
-            parallelization = (false, HashMap::new());
-        } else {
-            parallelization = check_parallelizability(&p, &vars_with_assign.1);
+        let mut parallelization= (false, HashMap::new());
+        match &execution_strategy {
+            ExecutionStrategy::AutomaticParallelization => {
+                let vars_with_assign = find_global::find_global(&p);
+                // println!("Variables changed in the main loop: {:#?}", vars_with_assign);
+                if !vars_with_assign.0 {
+                    parallelization = (false, HashMap::new());
+                } else {
+                    parallelization = check_parallelizability(&p, &vars_with_assign.1);
+                }
+            }
+            _ => {}
         }
+
         // println!("Parallelization check results: {:#?}", parallelization);
 
         // Now that we have all the functions in place, it's time to fill them up and convert them
@@ -599,7 +605,7 @@ where
                 let name = match &global_var {
                     GlobalVar::Scalar(i) => i,
                     GlobalVar::ArrayExact(i, _) => i,
-                    GlobalVar::ArrayUnknown(i) => i,
+                    GlobalVar::ArrayUnknown(i) => &i.id,
                 };
                 if let Some(ident) = shared.hm.get(name) {
                     variables.entry(*ident).or_insert(HashSet::new()).insert((global_var, op));
