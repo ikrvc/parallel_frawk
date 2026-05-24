@@ -441,7 +441,8 @@ where
         arena: &'a arena::Arena,
         p: &ast::Prog<'a, 'b, I>,
         esc: Escaper,
-        execution_strategy: ExecutionStrategy
+        execution_strategy: ExecutionStrategy,
+        strict_output_order: bool,
     ) -> Result<Self> {
         // TODO this function is a bit of a slog. It would be nice to break it up.
         let mut shared: GlobalContext<I> = GlobalContext {
@@ -519,7 +520,7 @@ where
                 if !vars_with_assign.0 {
                     parallelization = (false, HashMap::new());
                 } else {
-                    parallelization = check_parallelizability(&p, &vars_with_assign.1);
+                    parallelization = check_parallelizability(&p, &vars_with_assign.1, strict_output_order);
                 }
             }
             _ => {}
