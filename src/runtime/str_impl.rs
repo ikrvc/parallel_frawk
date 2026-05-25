@@ -1148,10 +1148,11 @@ struct BufHeader {
     count: Cell<usize>,
 }
 
-#[repr(transparent)]
+#[repr(transparent)]#[derive(Clone)]
 pub struct UniqueBuf(*mut BufHeader);
 unsafe impl Send for UniqueBuf {}
 
+#[derive(Clone)]
 pub struct DynamicBufHeap {
     data: UniqueBuf,
     write_head: usize,
@@ -1255,6 +1256,7 @@ impl Write for DynamicBufHeap {
     }
 }
 
+#[derive(Clone)]
 pub enum DynamicBuf {
     Inline(smallvec::SmallVec<[u8; MAX_INLINE_SIZE]>),
     Heap(DynamicBufHeap),

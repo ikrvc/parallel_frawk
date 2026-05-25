@@ -6,6 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::hash::Hash;
 use std::io;
+use std::io::Write;
 use std::iter::FromIterator;
 use std::mem;
 use std::rc::Rc;
@@ -33,6 +34,7 @@ pub use splitter::{
     ChainedReader, Line, LineReader,
 };
 pub use str_impl::{Str, UniqueStr};
+use crate::runtime::str_impl::DynamicBuf;
 
 #[derive(Default)]
 pub struct RegexCache(Registry<Regex>);
@@ -212,7 +214,7 @@ impl RegexCache {
 }
 
 #[derive(Clone)]
-pub(crate) struct FileWrite(writers::Registry);
+pub(crate) struct FileWrite(writers::Registry, Option<DynamicBuf>, bool);
 
 impl Default for FileWrite {
     fn default() -> FileWrite {
@@ -228,7 +230,27 @@ impl FileWrite {
         self.0.close(path)
     }
     pub(crate) fn new(ff: impl writers::FileFactory) -> FileWrite {
-        FileWrite(writers::Registry::from_factory(ff))
+        FileWrite(writers::Registry::from_factory(ff), None, false)
+    }
+
+    pub(crate) fn clone_with_buffer(& self) -> FileWrite {
+        FileWrite (
+            self.0.clone(),
+            Some(DynamicBuf::default()),
+            true
+        )
+    }
+
+    pub(crate) fn flush_buffered_default_output(&mut self) -> Result<()> {
+        if let Some(buf) = self.1.take() {
+            // print!("Flushing");
+              let mut handle =  self.0
+                    .get_handle(None, FileSpec::default())?;
+              handle.write(&buf.into_str(), FileSpec::default())?;
+            handle.flush()?;
+        }
+        self.2 = false;
+        Ok(())
     }
 
     pub(crate) fn shutdown(&mut self) -> Result<()> {
@@ -244,6 +266,13 @@ impl FileWrite {
         let (handle, fspec) = if let Some((out_file, fspec)) = path {
             (self.0.get_handle(Some(out_file), fspec)?, fspec)
         } else {
+            //write to buffer in case of parallel exec
+            if self.2 {
+                if let Some(buf) = &mut self.1 {
+                    spec.with_bytes(|spec| printf::printf(buf, spec, pa))?;
+                    return Ok(());
+                }
+            }
             (
                 self.0.get_handle(None, FileSpec::default())?,
                 FileSpec::default(),
@@ -262,6 +291,17 @@ impl FileWrite {
         if let Some((path, spec)) = out_spec {
             self.0.get_handle(Some(path), spec)?.write_all(ss, spec)
         } else {
+            //write to buffer in case of parallel exec
+            if self.2 {
+                if let Some(buf) = &mut self.1 {
+                    for s in ss {
+                        let bs = unsafe { &*s.get_bytes() };
+                        buf.write(bs);
+                        buf.write_all(b"\n");
+                        return Ok(());
+                    }
+                }
+            }
             self.0
                 .get_handle(None, FileSpec::default())?
                 .write_all(ss, FileSpec::Append)
