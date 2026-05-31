@@ -276,7 +276,9 @@ where
                             if matches!(execution_strategy, ExecutionStrategy::AutomaticParallelization) {
                                 let mut writers = Vec::new();
                                 let mut iter = results.into_iter();
-                                let mut last_res = iter.next().expect("Can not be less than one").1;
+                                let mut full_res = iter.next().expect("Can not be less than one");
+                                writers.push(full_res.2);
+                                let mut last_res = full_res.1;
                                 for (_, mut res, writer) in iter {
                                     writers.push(writer);
                                     res.combine_parallel(last_res, &parallelization_slots);
