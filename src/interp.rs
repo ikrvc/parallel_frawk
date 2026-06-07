@@ -402,10 +402,10 @@ pub fn combine_slot<T: Default>(vec: &mut Vec<T>, slot: usize, f: impl FnOnce(T)
 }
 
 impl<'a> Core<'a> {
-    pub fn shuttle(&self, pid: Int) -> impl FnOnce() -> Core<'a> + Send {
+    pub fn shuttle(&self, pid: Int, buffered_output: bool) -> impl FnOnce() -> Core<'a> + Send {
         use crate::builtins::Variables;
         let seed: u64 = rand::rng().random();
-        let fw = self.write_files.clone();
+        let fw = if buffered_output {self.write_files.clone_with_buffer()} else {self.write_files.clone()};
         let fs: UniqueStr<'a> = self.vars.fs.clone().into();
         let ofs: UniqueStr<'a> = self.vars.ofs.clone().into();
         let rs: UniqueStr<'a> = self.vars.rs.clone().into();
@@ -1055,7 +1055,7 @@ impl<'a, LR: LineReader> Interp<'a, LR> {
             let iters_str_size = self.iters_str.regs.len();
             for (i, handle) in handles.into_iter().enumerate() {
                 let sender = sender.clone();
-                let core_shuttle = self.core.shuttle(i as Int + 2);
+                let core_shuttle = self.core.shuttle(i as Int + 2, false);
                 let instrs = self.instrs.clone();
                 s.spawn(move |_| {
                     if let Some(read_files) = handle() {

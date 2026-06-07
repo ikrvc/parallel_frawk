@@ -299,7 +299,8 @@ fn get_context<'a>(
     prog: &str,
     a: &'a Arena,
     mut prelude: Prelude<'a>,
-    execution_strategy: ExecutionStrategy
+    execution_strategy: ExecutionStrategy,
+    strict_output_order: bool,
 ) -> cfg::ProgramContext<'a, &'a str> {
     let prog = a.alloc_str(prog);
     let lexer = lexer::Tokenizer::new(prog);
@@ -320,7 +321,7 @@ fn get_context<'a>(
             fail!("{}", e);
         }
     };
-    match cfg::ProgramContext::from_prog(a, stmt, prelude.scalars.escaper, execution_strategy) {
+    match cfg::ProgramContext::from_prog(a, stmt, prelude.scalars.escaper, execution_strategy, strict_output_order) {
         Ok(mut ctx) => {
             ctx.allow_arbitrary_commands = prelude.scalars.arbitrary_shell;
             ctx.fold_regex_constants = prelude.scalars.fold_regexes;
@@ -379,7 +380,7 @@ cfg_if::cfg_if! {
 
         fn dump_llvm(prog: &str, cfg: codegen::Config, raw: &RawPrelude) -> String {
             let a = Arena::default();
-            let mut ctx = get_context(prog, &a, get_prelude(&a, raw), ExecutionStrategy::Serial);
+            let mut ctx = get_context(prog, &a, get_prelude(&a, raw), ExecutionStrategy::Serial, false);
             match compile::dump_llvm(&mut ctx, cfg) {
                 Ok(s) => s,
                 Err(e) => fail!("error compiling llvm: {}", e),
@@ -394,7 +395,7 @@ const DEFAULT_OPT_LEVEL: i32 = 3;
 fn dump_bytecode(prog: &str, raw: &RawPrelude) -> String {
     use std::io::Cursor;
     let a = Arena::default();
-    let mut ctx = get_context(prog, &a, get_prelude(&a, raw), ExecutionStrategy::Serial);
+    let mut ctx = get_context(prog, &a, get_prelude(&a, raw), ExecutionStrategy::Serial, false);
     let fake_inp: Box<dyn io::Read + Send> = Box::new(Cursor::new(vec![]));
     let interp = match compile::bytecode(
         &mut ctx,
@@ -523,7 +524,11 @@ fn main() {
         .arg(Arg::new("check-parallel")
              .long("check-parallel")
              .takes_value(false)
-             .help("Check if the program is parallelizable"));
+             .help("Check if the program is parallelizable"))
+        .arg(Arg::new("strict-output-order")
+             .long("strict-output-order")
+             .takes_value(false)
+             .help("When set, disable parallelization for any program that contains print or printf statements, ensuring output is produced in strict input order"));
     cfg_if::cfg_if! {
         if #[cfg(feature = "llvm_backend")] {
             app = app.arg(Arg::new("dump-llvm")
@@ -549,6 +554,7 @@ fn main() {
             x
         ),
     };
+    let strict_output_mode = matches.is_present("strict-output-order");
 
     // NB: do we want this to be a command-line param?
     let chunk_size = if let Some(cs) = matches.value_of("chunk-size") {
@@ -673,7 +679,7 @@ fn main() {
     if opt_dump_cfg {
         let a = Arena::default();
         let ctx = get_context(program_string.as_str(), &a, get_prelude(&a, &raw),
-                              ExecutionStrategy::Serial);
+                              ExecutionStrategy::Serial, false);
         let mut stdout = std::io::stdout();
         let _ = ctx.dbg_print(&mut stdout);
     }
@@ -876,7 +882,7 @@ fn main() {
     }
 
     let a = Arena::default();
-    let ctx = get_context(program_string.as_str(), &a, get_prelude(&a, &raw), exec_strategy);
+    let ctx = get_context(program_string.as_str(), &a, get_prelude(&a, &raw), exec_strategy, strict_output_mode);
 
     let opt_check_parallel = matches.is_present("check-parallel");
     if opt_check_parallel {

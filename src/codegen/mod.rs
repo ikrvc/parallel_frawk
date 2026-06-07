@@ -225,7 +225,11 @@ where
                             i,
                             reader,
                             sender.clone(),
-                            rt.core.shuttle(i as runtime::Int + 2),
+                            if matches!(execution_strategy, ExecutionStrategy::AutomaticParallelization) {
+                                rt.core.shuttle(i as runtime::Int + 2, true)
+                            } else {
+                                rt.core.shuttle(i as runtime::Int + 2, false)
+                            },
                         )
                     })
                     .collect();
@@ -242,7 +246,7 @@ where
                                         core: shuttle(),
                                         input_data: reader.into(),
                                         cleanup: Cleanup::<Runtime>::new(move |rt| {
-                                            sender.send((i, rt.core.extract_result(0))).unwrap();
+                                            sender.send((i, rt.core.extract_result(0), mem::take(&mut rt.core.write_files))).unwrap();
                                         }),
                                         cancel_signal,
                                     };
@@ -258,20 +262,25 @@ where
                                 Cleanup::<Runtime>::new(move |_| while r.recv().is_ok() {});
                             main_loop_fn.invoke(&mut rt);
                             rt.cleanup.cancel();
+                            rt.core.write_files.flush_stdout();
                         }
                         rt.core.vars.pid = 0;
 
                         with_input!(&mut rt.input_data, |(_, read_files)| {
                             let mut results = Vec::new();
-                            while let Ok((idx, res)) = receiver.recv() {
-                                results.push((idx, res));
+                            while let Ok((idx, res, write_files)) = receiver.recv() {
+                                results.push((idx, res, write_files));
                             }
                             // Sort by index in descending order to combine latest spawned first
-                            results.sort_by_key(|(idx, _)| -(*idx as i32));
+                            results.sort_by_key(|(idx, _, _)| -(*idx as i32));
                             if matches!(execution_strategy, ExecutionStrategy::AutomaticParallelization) {
+                                let mut writers = Vec::new();
                                 let mut iter = results.into_iter();
-                                let mut last_res = iter.next().expect("Can not be less than one").1;
-                                for (_, mut res) in iter {
+                                let mut full_res = iter.next().expect("Can not be less than one");
+                                writers.push(full_res.2);
+                                let mut last_res = full_res.1;
+                                for (_, mut res, writer) in iter {
+                                    writers.push(writer);
                                     res.combine_parallel(last_res, &parallelization_slots);
                                     last_res = res;
                                 }
@@ -279,8 +288,11 @@ where
                                 if let Some(val) = saved_state_after_begin {
                                     rt.core.apply_initial_values(val, &parallelization_slots);
                                 }
+                                for mut writer in writers.into_iter().rev() {
+                                    writer.flush_buffered_default_output();
+                                }
                             } else {
-                                for (_, res) in results {
+                                for (_, res, _) in results {
                                     rt.core.combine(res);
                                 }
                             }

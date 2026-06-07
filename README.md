@@ -1,3 +1,5 @@
+# Parallel AWK
+
 # frawk
 
 *Note (2024, ezrosent@) While the [policy](https://github.com/ezrosent/frawk?tab=readme-ov-file#bugs-and-feature-requests)

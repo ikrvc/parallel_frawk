@@ -1,0 +1,1 @@
+$1 ~ /Europe/ {i++} END { print i }

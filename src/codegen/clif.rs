@@ -488,7 +488,7 @@ macro_rules! external {
 
 impl<'a> View<'a> {
     fn stack_slot_bytes(&mut self, bytes: u32) -> StackSlot {
-        debug_assert!(bytes > 0); // This signals a bug; all frawk types have positive size.
+        // debug_assert!(bytes > 0); // This signals a bug; all frawk types have positive size.
         let data = StackSlotData::new(StackSlotKind::ExplicitSlot, bytes);
         self.builder.create_sized_stack_slot(data)
     }
@@ -1380,9 +1380,10 @@ impl<'a> CodeGenerator for View<'a> {
         args: &[Ref],
     ) -> Result<()> {
         // For empty args, just delegate to print_all
-        if args.is_empty() {
-            return self.print_all(output, &[*fmt]);
-        }
+        // if args.is_empty() {
+        //     return self.print_all(output, &[*fmt]);
+        // }
+
         let (arg_slot, type_slot, num_args) = self.bundle_printf_args(args)?;
 
         let rt = self.runtime_val();

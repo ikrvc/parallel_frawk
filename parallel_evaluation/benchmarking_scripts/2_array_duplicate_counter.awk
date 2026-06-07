@@ -1,0 +1,1 @@
+{x[$1]++} END { res = 0; for (val in x) {i += x[val]-1} print i }

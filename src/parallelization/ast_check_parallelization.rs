@@ -20,7 +20,7 @@ pub enum ParallelOp {
     LastAssigned
 }
 
-pub fn check_parallelizability<'a, 'b, I: IsSprintf+Clone + Hash + Eq+Debug>(program: &ast::Prog<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'a, I>>) -> (bool, HashMap<GlobalVar<'a, I>, ParallelOp>)
+pub fn check_parallelizability<'a, 'b, I: IsSprintf+Clone + Hash + Eq+Debug>(program: &ast::Prog<'a, 'b, I>, global_vars: &HashSet<GlobalVar<'a, I>>, strict_output_order: bool) -> (bool, HashMap<GlobalVar<'a, I>, ParallelOp>)
     where Function: TryFrom<I>
 {
     // println!("Global vars: {:?}", global_vars);
@@ -36,7 +36,7 @@ pub fn check_parallelizability<'a, 'b, I: IsSprintf+Clone + Hash + Eq+Debug>(pro
     for (_, maybe_stmt) in &program.pats {
         match maybe_stmt {
             Some(stmt) => {
-                if !check_statement_parallelizability(stmt, &truly_globals, &mut result) {return (false, result)}
+                if !check_statement_parallelizability(stmt, &truly_globals, &mut result, strict_output_order) {return (false, result)}
             },
             None => continue,
         }
@@ -155,22 +155,22 @@ pub fn define_builtin<I:Clone>(func: &Either<I, Function>) -> Either<I, Function
     }
 }
 
-fn check_statement_parallelizability<'a, I: IsSprintf+Clone + Hash + Eq+Debug>(stmt: &Stmt<'_, 'a, I>, global_vars: &HashSet<GlobalVar<'a, I>>, result: &mut HashMap<GlobalVar<'a, I>, ParallelOp>) -> bool
+fn check_statement_parallelizability<'a, I: IsSprintf+Clone + Hash + Eq+Debug>(stmt: &Stmt<'_, 'a, I>, global_vars: &HashSet<GlobalVar<'a, I>>, result: &mut HashMap<GlobalVar<'a, I>, ParallelOp>, strict_output_order: bool) -> bool
 where Function: TryFrom<I>
 {
     match stmt {
         Stmt::Expr(expr) => check_expression_for_parallelizability(expr, global_vars, result, &mut Vec::new()),
         Stmt::Block(vec) => {
             for stmt in vec {
-                if !check_statement_parallelizability(stmt, global_vars, result) {return false}
+                if !check_statement_parallelizability(stmt, global_vars, result, strict_output_order) {return false}
             }
             true
         }
         Stmt::If(cond, stmt1, stmt2) => {
             if !check_expression_for_global_vars(cond, global_vars, &mut Vec::new()) {return false}
-            if !check_statement_parallelizability(stmt1, global_vars, result) {return false}
+            if !check_statement_parallelizability(stmt1, global_vars, result, strict_output_order) {return false}
             if let Some(stmt) = stmt2 {
-                return check_statement_parallelizability(stmt, global_vars, result)
+                return check_statement_parallelizability(stmt, global_vars, result, strict_output_order)
             }
             true
         }
@@ -190,27 +190,30 @@ where Function: TryFrom<I>
                 }
                 _ => {if !check_expression_for_global_vars(cond, global_vars, &mut Vec::new()) {return false}}
             }
-            if !check_statement_parallelizability(stmt, global_vars, result) {return false}
+            if !check_statement_parallelizability(stmt, global_vars, result, strict_output_order) {return false}
             true
         },
         Stmt::DoWhile(cond, stmt) => {
-            if !check_statement_parallelizability(stmt, global_vars, result) {return false}
+            if !check_statement_parallelizability(stmt, global_vars, result, strict_output_order) {return false}
             if !check_expression_for_global_vars(cond, global_vars, &mut Vec::new()) {return false}
             true
         }
         Stmt::For(stmt1, cond, stmt2, stmt3) => {
             if let Some(stmt) = stmt1 {
-                if !check_statement_parallelizability(stmt, global_vars, result) {return false}
+                if !check_statement_parallelizability(stmt, global_vars, result, strict_output_order) {return false}
             }
             if let Some(cond) = cond {
                 if !check_expression_for_global_vars(cond, global_vars, &mut Vec::new()) {return false}
             }
             if let Some(stmt) = stmt2 {
-                if !check_statement_parallelizability(stmt, global_vars, result) {return false}
+                if !check_statement_parallelizability(stmt, global_vars, result, strict_output_order) {return false}
             }
-            check_statement_parallelizability(stmt3, global_vars, result)
+            check_statement_parallelizability(stmt3, global_vars, result, strict_output_order)
         }
         Stmt::Print(expressions, spec) => {  // file spec is not implemented here
+            if strict_output_order {
+                return false;
+            }
             if let Some((expr, _)) = spec {
                 if !check_expression_for_global_vars(expr, global_vars, &mut Vec::new()) {return false}
             }
@@ -220,6 +223,9 @@ where Function: TryFrom<I>
             true
         }
         Stmt::Printf(expr, variables, spec) => {  // file spec is not implemented here
+            if strict_output_order {
+                return false;
+            }
             if let Some((e, _)) = spec {
                 if !check_expression_for_global_vars(e, global_vars, &mut Vec::new()) {return false}
             }
@@ -721,7 +727,7 @@ mod tests {
         let stmt = Stmt::Expr(&Expr::<&str>::ILit(1));
         let globals = HashSet::new();
         let mut result = HashMap::new();
-        assert!(check_statement_parallelizability(&stmt, &globals, &mut result));
+        assert!(check_statement_parallelizability(&stmt, &globals, &mut result, false));
     }
 
     #[test]
@@ -730,7 +736,7 @@ mod tests {
         let mut globals = HashSet::new();
         globals.insert(GlobalVar::Scalar("x"));
         let mut result = HashMap::new();
-        assert!(check_statement_parallelizability(&stmt, &globals, &mut result));
+        assert!(check_statement_parallelizability(&stmt, &globals, &mut result, false));
     }
 
     #[test]
@@ -740,7 +746,7 @@ mod tests {
         let stmt: Stmt<'_, '_, &str> = Stmt::Block(vec);
         let globals = HashSet::new();
         let mut result = HashMap::new();
-        assert!(check_statement_parallelizability(&stmt, &globals, &mut result));
+        assert!(check_statement_parallelizability(&stmt, &globals, &mut result, false));
     }
 
     #[test]
@@ -753,7 +759,7 @@ mod tests {
         let stmt = Stmt::Block(vec);
         let globals = HashSet::new();
         let mut result = HashMap::new();
-        assert!(check_statement_parallelizability(&stmt, &globals, &mut result));
+        assert!(check_statement_parallelizability(&stmt, &globals, &mut result, false));
     }
 
     #[test]
@@ -761,7 +767,7 @@ mod tests {
         let stmt = Stmt::If(&Expr::<&str>::ILit(1), &Stmt::Expr(&Expr::ILit(2)), None);
         let globals = HashSet::new();
         let mut result = HashMap::new();
-        assert!(check_statement_parallelizability(&stmt, &globals, &mut result));
+        assert!(check_statement_parallelizability(&stmt, &globals, &mut result, false));
     }
 
     #[test]
@@ -769,7 +775,7 @@ mod tests {
         let stmt = Stmt::If(&Expr::<&str>::ILit(1), &Stmt::Expr(&Expr::ILit(2)), Some(&Stmt::Expr(&Expr::ILit(3))));
         let globals = HashSet::new();
         let mut result = HashMap::new();
-        assert!(check_statement_parallelizability(&stmt, &globals, &mut result));
+        assert!(check_statement_parallelizability(&stmt, &globals, &mut result, false));
     }
 
     #[test]
@@ -778,7 +784,7 @@ mod tests {
         globals.insert(GlobalVar::Scalar("x"));
         let stmt = Stmt::If(&Expr::Var("x"), &Stmt::Expr(&Expr::ILit(1)), None);
         let mut result = HashMap::new();
-        assert!(!check_statement_parallelizability(&stmt, &globals, &mut result));
+        assert!(!check_statement_parallelizability(&stmt, &globals, &mut result, false));
     }
 
     #[test]
@@ -786,7 +792,7 @@ mod tests {
         let stmt = Stmt::Print(&[&Expr::<&str>::ILit(1), &Expr::ILit(2)], None);
         let globals = HashSet::new();
         let mut result = HashMap::new();
-        assert!(check_statement_parallelizability(&stmt, &globals, &mut result));
+        assert!(check_statement_parallelizability(&stmt, &globals, &mut result, false));
     }
 
     #[test]
@@ -795,7 +801,25 @@ mod tests {
         globals.insert(GlobalVar::Scalar("x"));
         let stmt = Stmt::Print(&[&Expr::Var("x")], None);
         let mut result = HashMap::new();
-        assert!(!check_statement_parallelizability(&stmt, &globals, &mut result));
+        assert!(!check_statement_parallelizability(&stmt, &globals, &mut result, false));
+    }
+
+    #[test]
+    fn test_statement_print_strict_output_order() {
+        // With strict_output_order=true, any print statement should return false
+        let stmt = Stmt::Print(&[&Expr::<&str>::ILit(1)], None);
+        let globals = HashSet::new();
+        let mut result = HashMap::new();
+        assert!(!check_statement_parallelizability(&stmt, &globals, &mut result, true));
+    }
+
+    #[test]
+    fn test_statement_printf_strict_output_order() {
+        // With strict_output_order=true, any printf statement should return false
+        let stmt = Stmt::Printf(&Expr::<&str>::StrLit(b"hello"), &[], None);
+        let globals = HashSet::new();
+        let mut result = HashMap::new();
+        assert!(!check_statement_parallelizability(&stmt, &globals, &mut result, true));
     }
 
     #[test]
