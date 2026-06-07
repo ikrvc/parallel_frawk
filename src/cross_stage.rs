@@ -64,8 +64,13 @@ pub(crate) fn compute_slots(
     main_loop: &Option<usize>,
     end: &Option<usize>,
     global_refs: Vec<HashSet<(NumTy, Ty)>>,
+    assigned_slots: Option<HashSet<(NumTy, Ty)>>
 ) -> SlotOps {
     let empty: HashSet<(NumTy, Ty)> = Default::default();
     let get_ref = |x: &Option<usize>| x.as_ref().map(|i| &global_refs[*i]).unwrap_or(&empty);
-    compute_par(get_ref(begin), get_ref(main_loop), get_ref(end))
+    let mut res = compute_par(get_ref(begin), get_ref(main_loop), get_ref(end));
+    if let Some(val) = assigned_slots {
+        res.begin_stores = res.begin_stores.union(&val).cloned().collect();
+    }
+    res
 }

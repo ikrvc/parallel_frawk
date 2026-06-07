@@ -79,12 +79,71 @@ impl Inline {
         Self::from_raw(bs.as_ptr(), bs.len())
     }
     fn len(&self) -> usize {
-        (self.0 as usize & 0xFF) >> 3
+        // (self.0 as usize & 0xFF) >> 3
+        ((self.0 as u8 & 0x78) >> 3) as usize
     }
     fn bytes(&self) -> &[u8] {
         unsafe { slice::from_raw_parts((self as *const Inline as *const u8).offset(1), self.len()) }
     }
+
+    fn empty_undefined() -> Inline {
+        let mut res = 0u128;
+        // metadata byte: tag = Inline, len = 0, is_undefined = 1
+        let meta: u8 = (0 << 3) | (StrTag::Inline as u8 & 0x7) | 0x80; // bit 7 = 1 = undefined
+        res |= meta as u128;
+        Inline(res)
+    }
+
+    fn is_defined(&self) -> bool {
+        (self.0 as u8 & 0x80) == 0
+    }
 }
+
+// impl Inline {
+//     unsafe fn from_raw(ptr: *const u8, len: usize) -> Inline {
+//         debug_assert!(len <= MAX_INLINE_SIZE);
+//         if len > MAX_INLINE_SIZE {
+//             std::hint::unreachable_unchecked();
+//         }
+//
+//         let mut res = 0u128;
+//
+//         // copy string bytes into the remaining bytes of u128 (skip metadata byte)
+//         ptr::copy_nonoverlapping(ptr, (&mut res as *mut u128 as *mut u8).offset(1), len);
+//
+//         // metadata byte: bits 0..2 tag, bits 3..6 len, bit 7 is_defined
+//         let mut meta: u8 = ((len as u8 & 0xF) << 3) | (StrTag::Inline as u8 & 0x7);
+//         meta |= 0x80; // mark as defined
+//
+//         res |= meta as u128;
+//
+//         Inline(res)
+//     }
+//
+//     unsafe fn from_unchecked(bs: &[u8]) -> Inline {
+//         Self::from_raw(bs.as_ptr(), bs.len())
+//     }
+//
+//     fn empty_undefined() -> Inline {
+//         let mut res = 0u128;
+//         // metadata byte: tag = Inline, len = 0, is_defined = 0
+//         let meta: u8 = (0 << 3) | (StrTag::Inline as u8 & 0x7);
+//         res |= meta as u128;
+//         Inline(res)
+//     }
+//
+//     fn len(&self) -> usize {
+//         ((self.0 as u8 & 0x78) >> 3) as usize  // mask bits 3..6, shift down
+//     }
+//
+//     fn bytes(&self) -> &[u8] {
+//         unsafe { slice::from_raw_parts((self as *const Inline as *const u8).offset(1), self.len()) }
+//     }
+//
+//     fn is_defined(&self) -> bool {
+//         (self.0 as u8 & 0x80) != 0
+//     }
+// }
 
 #[derive(Clone)]
 #[repr(C)]
@@ -167,6 +226,17 @@ impl<'a> StrRep<'a> {
             3 => Concat,
             4 => Boxed,
             _ => unreachable!(),
+        }
+    }
+
+    fn new_undefined() -> StrRep<'a> {
+        Inline::empty_undefined().into()
+    }
+
+    fn is_undefined(&self) -> bool {
+        match self.get_tag() {
+            StrTag::Inline => (self.hi & 0x80) != 0,
+            _ => false,
         }
     }
 }
@@ -304,6 +374,15 @@ impl<'a> UniqueStr<'a> {
     pub fn into_str(self) -> Str<'a> {
         self.0
     }
+
+    pub fn as_str(&self) -> &'a Str {
+        &self.0
+    }
+
+    pub fn is_undefined(&self) -> bool {
+        self.0.is_undefined()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -376,6 +455,17 @@ impl<'a> From<Str<'a>> for UniqueStr<'a> {
 pub struct Str<'a>(UnsafeCell<StrRep<'a>>);
 
 impl<'a> Str<'a> {
+    pub fn new_undefined() -> Self {
+        Str(UnsafeCell::new(StrRep::new_undefined()))
+    }
+
+    pub fn is_undefined(&self) -> bool {
+        unsafe {
+            let inner: &StrRep = &*self.0.get();
+            inner.is_undefined()
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         unsafe { mem::transmute::<&Str, &Inline>(self) == &Inline::default() }
     }
@@ -1058,10 +1148,11 @@ struct BufHeader {
     count: Cell<usize>,
 }
 
-#[repr(transparent)]
+#[repr(transparent)]#[derive(Clone)]
 pub struct UniqueBuf(*mut BufHeader);
 unsafe impl Send for UniqueBuf {}
 
+#[derive(Clone)]
 pub struct DynamicBufHeap {
     data: UniqueBuf,
     write_head: usize,
@@ -1165,6 +1256,7 @@ impl Write for DynamicBufHeap {
     }
 }
 
+#[derive(Clone)]
 pub enum DynamicBuf {
     Inline(smallvec::SmallVec<[u8; MAX_INLINE_SIZE]>),
     Heap(DynamicBufHeap),

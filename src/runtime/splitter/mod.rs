@@ -39,7 +39,7 @@ pub trait Line<'a>: Default {
 pub trait LineReader: Sized {
     type Line: for<'a> Line<'a>;
     fn filename(&self) -> Str<'static>;
-    fn request_handles(&self, _size: usize) -> Vec<Box<dyn FnOnce() -> Self + Send>> {
+    fn request_handles(&mut self, _size: usize) -> Vec<Box<dyn FnOnce() -> Self + Send>> {
         vec![]
     }
     fn wait(&self) -> bool {

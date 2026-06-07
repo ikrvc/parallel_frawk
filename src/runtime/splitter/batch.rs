@@ -33,7 +33,7 @@ use crate::runtime::{
     str_impl::{Buf, Str, UniqueBuf},
     Int, RegexCache,
 };
-
+use crate::runtime::splitter::chunk::SlicedChunkProducer;
 use super::{
     chunk::{
         self, CancellableChunkProducer, Chunk, ChunkProducer, OffsetChunk, ParallelChunkProducer,
@@ -68,7 +68,7 @@ impl LineReader for CSVReader<Box<dyn ChunkProducer<Chunk = OffsetChunk>>> {
     fn check_utf8(&self) -> bool {
         self.check_utf8
     }
-    fn request_handles(&self, size: usize) -> Vec<Box<dyn FnOnce() -> Self + Send>> {
+    fn request_handles(&mut self, size: usize) -> Vec<Box<dyn FnOnce() -> Self + Send>> {
         let producers = self.prod.try_dyn_resize(size);
         let mut res = Vec::with_capacity(producers.len());
         let ifmt = self.ifmt;
@@ -140,7 +140,7 @@ impl CSVReader<Box<dyn ChunkProducer<Chunk = OffsetChunk>>> {
         S: Read + Send + 'static,
     {
         let prod: Box<dyn ChunkProducer<Chunk = OffsetChunk>> = match exec_strategy {
-            ExecutionStrategy::Serial => Box::new(chunk::new_chained_offset_chunk_producer_csv(
+            ExecutionStrategy::Serial | ExecutionStrategy::AutomaticParallelization => Box::new(chunk::new_chained_offset_chunk_producer_csv(
                 rs, chunk_size, ifmt, check_utf8,
             )),
             x @ ExecutionStrategy::ShardPerRecord => {
@@ -1464,7 +1464,7 @@ impl ByteReader<Box<dyn ChunkProducer<Chunk = OffsetChunk>>> {
         S: Read + Send + 'static,
     {
         let prod: Box<dyn ChunkProducer<Chunk = OffsetChunk>> = match exec_strategy {
-            ExecutionStrategy::Serial => Box::new(chunk::new_chained_offset_chunk_producer_bytes(
+            ExecutionStrategy::Serial | ExecutionStrategy::AutomaticParallelization => Box::new(chunk::new_chained_offset_chunk_producer_bytes(
                 rs, chunk_size, field_sep, record_sep, check_utf8, kernel,
             )),
             x @ ExecutionStrategy::ShardPerRecord => {
@@ -1574,6 +1574,24 @@ impl ByteReader<Box<dyn ChunkProducer<Chunk = OffsetChunk<WhitespaceOffsets>>>> 
                         ),
                     ))
                 }
+                ExecutionStrategy::AutomaticParallelization => {
+                    let iter = rs.enumerate().map(move |(i, (r, name))| {
+                        move || {
+                            chunk::new_offset_chunk_producer_ascii_whitespace(
+                                r,
+                                chunk_size,
+                                name.as_str(),
+                                i as u32 + 1,
+                                check_utf8,
+                                find_indexes,
+                            )
+                        }
+                    });
+                    Box::new(CancellableChunkProducer::new(
+                        cancel_signal,
+                        SlicedChunkProducer::new(iter),
+                    ))
+                }
                 ExecutionStrategy::ShardPerFile => {
                     let iter = rs.enumerate().map(move |(i, (r, name))| {
                         move || {
@@ -1621,7 +1639,7 @@ where
     fn wait(&self) -> bool {
         ByteReaderBase::wait(self)
     }
-    fn request_handles(&self, size: usize) -> Vec<Box<dyn FnOnce() -> Self + Send>> {
+    fn request_handles(&mut self, size: usize) -> Vec<Box<dyn FnOnce() -> Self + Send>> {
         let producers = self.prod.try_dyn_resize(size);
         let mut res = Vec::with_capacity(producers.len());
         for p_factory in producers.into_iter() {
@@ -2231,7 +2249,7 @@ unquoted,commas,"as well, including some long ones", and there we have it.""#;
         if corpus.as_bytes().last() == Some(&b'\n') {
             expected = expected.checked_sub(1).unwrap();
         }
-        let reader = make_br(std::io::Cursor::new(corpus));
+        let mut reader = make_br(std::io::Cursor::new(corpus));
         let others = reader.request_handles(n_threads);
         assert_eq!(others.len(), n_threads);
         let mut threads = Vec::new();

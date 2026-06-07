@@ -16,6 +16,7 @@ use regex::bytes::Regex;
 use std::marker::PhantomData;
 use std::mem;
 use std::sync::Arc;
+use hashbrown::{HashMap, HashSet};
 
 /// Options used to configure a code-generating backend.
 #[derive(Copy, Clone)]
@@ -37,6 +38,10 @@ pub(crate) mod clif;
 pub(crate) mod llvm;
 
 use intrinsics::Runtime;
+use crate::common::{Either, ExecutionStrategy};
+use crate::compile::Ty;
+use crate::parallelization::ast_check_parallelization::ParallelOp;
+use crate::parallelization::find_global::IndexVal;
 
 pub(crate) type Ref = (NumTy, compile::Ty);
 pub(crate) type StrReg<'a> = bytecode::Reg<runtime::Str<'a>>;
@@ -145,6 +150,8 @@ pub(crate) unsafe fn run_main<R, FF, J>(
     named_columns: Option<Vec<&[u8]>>,
     num_workers: usize,
     cancel_signal: CancelSignal,
+    execution_strategy: ExecutionStrategy,
+    parallelization_slots: Option<HashMap<(Ty, usize), Either<HashSet<(IndexVal, ParallelOp)>, ParallelOp>>>
 ) -> Result<()>
 where
     R: intrinsics::IntoRuntime,
@@ -167,6 +174,13 @@ where
             // as well as mutable access to the same "read_files" value. The generated code is
             // pretty awful; It may be worth a RefCell just to clean up.
             with_input!(&mut rt.input_data, |(_, read_files)| {
+                if matches!(execution_strategy, ExecutionStrategy::Serial) {
+                     // execute serially.
+                    for main in begin.into_iter().chain(main_loop).chain(end) {
+                        main.invoke(&mut rt);
+                    }
+                    return Ok(());
+                }
                 let reads = read_files.try_resize(num_workers.saturating_sub(1));
                 if num_workers <= 1 || reads.is_empty() || main_loop.is_none() {
                     // execute serially.
@@ -192,6 +206,14 @@ where
                     return Ok(());
                 }
 
+                let mut saved_state_after_begin = None;
+                if matches!(execution_strategy, ExecutionStrategy::AutomaticParallelization) {
+                    if let Some(val) = &parallelization_slots {
+                        saved_state_after_begin = Some(rt.core.change_state_for_parallelization(val));
+                    }
+                }
+
+
                 rt.concurrent = true;
 
                 let (sender, receiver) = crossbeam_channel::bounded(reads.len());
@@ -200,9 +222,14 @@ where
                     .enumerate()
                     .map(|(i, reader)| {
                         (
+                            i,
                             reader,
                             sender.clone(),
-                            rt.core.shuttle(i as runtime::Int + 2),
+                            if matches!(execution_strategy, ExecutionStrategy::AutomaticParallelization) {
+                                rt.core.shuttle(i as runtime::Int + 2, true)
+                            } else {
+                                rt.core.shuttle(i as runtime::Int + 2, false)
+                            },
                         )
                     })
                     .collect();
@@ -210,7 +237,7 @@ where
                     let old_read_files = mem::take(&mut read_files.inputs);
                     let main_loop_fn = main_loop.unwrap();
                     let scope_res = crossbeam::scope(|s| {
-                        for (reader, sender, shuttle) in launch_data.into_iter() {
+                        for (i, reader, sender, shuttle) in launch_data.into_iter() {
                             let cancel_signal = cancel_signal.clone();
                             s.spawn(move |_| {
                                 if let Some(reader) = reader() {
@@ -219,7 +246,7 @@ where
                                         core: shuttle(),
                                         input_data: reader.into(),
                                         cleanup: Cleanup::<Runtime>::new(move |rt| {
-                                            sender.send(rt.core.extract_result(0)).unwrap();
+                                            sender.send((i, rt.core.extract_result(0), mem::take(&mut rt.core.write_files))).unwrap();
                                         }),
                                         cancel_signal,
                                     };
@@ -235,18 +262,47 @@ where
                                 Cleanup::<Runtime>::new(move |_| while r.recv().is_ok() {});
                             main_loop_fn.invoke(&mut rt);
                             rt.cleanup.cancel();
+                            rt.core.write_files.flush_stdout();
                         }
                         rt.core.vars.pid = 0;
 
                         with_input!(&mut rt.input_data, |(_, read_files)| {
-                            while let Ok(res) = receiver.recv() {
-                                rt.core.combine(res);
+                            let mut results = Vec::new();
+                            while let Ok((idx, res, write_files)) = receiver.recv() {
+                                results.push((idx, res, write_files));
                             }
+                            // Sort by index in descending order to combine latest spawned first
+                            results.sort_by_key(|(idx, _, _)| -(*idx as i32));
+                            if matches!(execution_strategy, ExecutionStrategy::AutomaticParallelization) {
+                                let mut writers = Vec::new();
+                                let mut iter = results.into_iter();
+                                let mut full_res = iter.next().expect("Can not be less than one");
+                                writers.push(full_res.2);
+                                let mut last_res = full_res.1;
+                                for (_, mut res, writer) in iter {
+                                    writers.push(writer);
+                                    res.combine_parallel(last_res, &parallelization_slots);
+                                    last_res = res;
+                                }
+                                rt.core.combine_parallel(last_res, &parallelization_slots);
+                                if let Some(val) = saved_state_after_begin {
+                                    rt.core.apply_initial_values(val, &parallelization_slots);
+                                }
+                                for mut writer in writers.into_iter().rev() {
+                                    writer.flush_buffered_default_output();
+                                }
+                            } else {
+                                for (_, res, _) in results {
+                                    rt.core.combine(res);
+                                }
+                            }
+
                             if let Some(rc) = cancel_signal.get_code() {
                                 mem::drop(rt);
                                 std::process::exit(rc);
                             }
                             rt.concurrent = false;
+                            // eprintln!("Slots after main loop: {:?}", rt.core.slots);
                             if let Some(end) = end {
                                 read_files.inputs = old_read_files;
                                 end.invoke(&mut rt);

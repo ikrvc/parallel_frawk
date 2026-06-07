@@ -24,20 +24,21 @@ pub enum ExecutionStrategy {
     /// Attempt to parallelize the script, where multiple worker threads each process a file at a
     /// time.
     ShardPerFile,
+    AutomaticParallelization
 }
 
 impl ExecutionStrategy {
     pub fn num_workers(&self) -> usize {
         use ExecutionStrategy::*;
         match self {
-            ShardPerFile | ShardPerRecord => num_cpus::get(),
+            ShardPerFile | ShardPerRecord | AutomaticParallelization => num_cpus::get(),
             Serial => 1,
         }
     }
     pub fn stage(&self) -> Stage<()> {
         use ExecutionStrategy::*;
         match self {
-            ShardPerRecord | ShardPerFile => Stage::Par {
+            ShardPerRecord | ShardPerFile | AutomaticParallelization => Stage::Par {
                 begin: None,
                 main_loop: None,
                 end: None,
@@ -118,7 +119,7 @@ impl<T> Stage<T> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Either<L, R> {
     Left(L),
     Right(R),

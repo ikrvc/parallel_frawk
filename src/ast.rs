@@ -1,3 +1,4 @@
+use std::hash::Hash;
 /// An "Abstract Syntax Tree" that fairly closely resembles the structure of an AWK program. This
 /// is the representation that the parser returns. A couple of basic desugaring rules are applied
 /// that translate a `Prog` into a bare `Stmt`, along with its accompanying function definitions.
@@ -39,12 +40,15 @@ static_map!(
     ["+", Unop::Pos]
 );
 
+#[derive(Debug)]
 pub struct FunDec<'a, 'b, I> {
     pub name: I,
     pub args: Vec<I>,
     pub body: &'a Stmt<'a, 'b, I>,
 }
 
+#[derive(Debug)]
+#[derive(Clone)]
 pub enum Pattern<'a, 'b, I> {
     Null,
     Bool(&'a Expr<'a, 'b, I>),
@@ -120,7 +124,7 @@ fn parse_header<'a, 'b, I: From<&'b str> + Clone>(
     )));
 }
 
-impl<'a, 'b, I: From<&'b str> + Clone> Prog<'a, 'b, I> {
+impl<'a, 'b, I: From<&'b str> + Clone + Hash> Prog<'a, 'b, I> {
     pub(crate) fn from_stage(arena: &'a Arena, stage: Stage<()>) -> Self {
         Prog {
             field_sep: None,
@@ -353,7 +357,7 @@ static_map!(
     ["^", Binop::Pow]
 );
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr<'a, 'b, I> {
     ILit(i64),
     FLit(f64),
@@ -389,6 +393,47 @@ pub enum Expr<'a, 'b, I> {
     ReadStdin,
     // Used for comma patterns
     Cond(usize),
+}
+
+impl<'a, 'b, I: PartialEq> Expr<'a, 'b, I> {
+    pub fn contains(&self, needle: &Expr<'a, 'b, I>) -> bool {
+        // If the current node matches
+        if self == needle {
+            return true;
+        }
+
+        use Expr::*;
+
+        match self {
+            ILit(_) | FLit(_) | StrLit(_) | PatLit(_) | ReadStdin | Cond(_) => false,
+
+            Unop(_, x) => x.contains(needle),
+
+            Binop(_, a, b)
+            | And(a, b)
+            | Or(a, b)
+            | Index(a, b)
+            | Assign(a, b)
+            | AssignOp(a, _, b) => a.contains(needle) || b.contains(needle),
+
+            Call(_, args) => args.iter().any(|arg| arg.contains(needle)),
+
+            Var(_) => false,
+
+            ITE(c, t, e) => {
+                c.contains(needle)
+                    || t.contains(needle)
+                    || e.contains(needle)
+            }
+
+            Inc { x, .. } => x.contains(needle),
+
+            Getline { into, from, .. } => {
+                into.map_or(false, |x| x.contains(needle))
+                    || from.map_or(false, |x| x.contains(needle))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
